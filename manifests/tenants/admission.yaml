@@ -1,0 +1,220 @@
+# What Pod Security "baseline" leaves open in tenant namespaces (the label arc-on-nas/tenant),
+# closed with admission policies built into the API server: no webhook to run. The validating
+# policies refuse the request with the message below; the mutating one changes the pod. None of
+# them matches anything outside tenant namespaces. Pods that existed before these were applied
+# are not checked again until they are recreated: after applying to a namespace with running
+# pods, restart its workloads (`kubectl -n <namespace> rollout restart deploy,sts,ds`) and recreate its
+# other pods (bare pods, Jobs).
+#
+# tenant-drop-net-raw (mutating) and tenant-pod-rules' first rule: every container drops the
+#   NET_RAW capability. "baseline" keeps the runtime's default capabilities, NET_RAW among them,
+#   and every pod on the node shares one bridge (cni0) that filters IP but not ARP: with raw
+#   sockets a pod could answer ARP for the pods' gateway or a runner pod's address and receive
+#   their traffic (DNS, the requests to the proxy). The mutating policy adds the drop to pods that
+#   lack it, so ordinary images need no change; a pod that adds NET_RAW back is refused by
+#   "baseline" itself.
+# tenant-pod-rules (on creation; neither can change afterwards):
+#   volumes: only configMap, downwardAPI, emptyDir, ephemeral, persistentVolumeClaim, projected
+#     and secret ("restricted"'s list without csi, for which no driver is installed). "baseline"
+#     refuses hostPath but allows the network volume types (nfs, iscsi, cephfs, rbd and others),
+#     which the node mounts from its own network namespace, the host's: an NFS export on the host
+#     or the LAN would become a pod's volume, past every NetworkPolicy.
+# tenant-pod-images (on creation and on every update, since a pod's image may be changed in place):
+#   images from registries on the internet only. The node pulls images itself, outside every
+#     NetworkPolicy and through no proxy for the stack network, and it may have registry mirrors
+#     for in-cluster registries (a CI image cache, say): an image named after a cluster Service,
+#     localhost or an IP address would reach those, or the host's ports.
+# tenant-service-external-ips: no Service with spec.externalIPs. Any Service may claim any address
+#   as an external IP, and kube-proxy then sends the whole cluster's traffic for that address and
+#   port to the Service's pods (CVE-2020-8554): a tenant could take over the proxy's address, and
+#   with it every runner's traffic to the internet. The API server's DenyServiceExternalIPs plugin
+#   would refuse them cluster-wide; this refuses them in tenant namespaces without a k3s flag.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: tenant-drop-net-raw
+spec:
+  failurePolicy: Fail
+  reinvocationPolicy: IfNeeded
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+  mutations:
+    # A JSON patch, one operation per container that lacks the drop, at the first level of
+    # securityContext.capabilities.drop that is missing. (An apply configuration may not change
+    # capabilities.drop: it is an atomic list.)
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          lists.range(size(object.spec.containers)).filter(i,
+          !(has(object.spec.containers[i].securityContext) &&
+          has(object.spec.containers[i].securityContext.capabilities) &&
+          has(object.spec.containers[i].securityContext.capabilities.drop) &&
+          object.spec.containers[i].securityContext.capabilities.drop.exists(d, d == 'ALL' || d == 'NET_RAW'))
+          ).map(i,
+          !has(object.spec.containers[i].securityContext) ?
+            JSONPatch{op: "add", path: "/spec/containers/" + string(i) + "/securityContext",
+              value: Object.spec.containers.securityContext{
+                capabilities: Object.spec.containers.securityContext.capabilities{drop: ["NET_RAW"]}}} :
+          !has(object.spec.containers[i].securityContext.capabilities) ?
+            JSONPatch{op: "add", path: "/spec/containers/" + string(i) + "/securityContext/capabilities",
+              value: Object.spec.containers.securityContext.capabilities{drop: ["NET_RAW"]}} :
+          !has(object.spec.containers[i].securityContext.capabilities.drop) ?
+            JSONPatch{op: "add", path: "/spec/containers/" + string(i) + "/securityContext/capabilities/drop",
+              value: ["NET_RAW"]} :
+            JSONPatch{op: "add", path: "/spec/containers/" + string(i) + "/securityContext/capabilities/drop/-",
+              value: "NET_RAW"}) +
+          (has(object.spec.initContainers) ?
+          lists.range(size(object.spec.initContainers)).filter(i,
+          !(has(object.spec.initContainers[i].securityContext) &&
+          has(object.spec.initContainers[i].securityContext.capabilities) &&
+          has(object.spec.initContainers[i].securityContext.capabilities.drop) &&
+          object.spec.initContainers[i].securityContext.capabilities.drop.exists(d, d == 'ALL' || d == 'NET_RAW'))
+          ).map(i,
+          !has(object.spec.initContainers[i].securityContext) ?
+            JSONPatch{op: "add", path: "/spec/initContainers/" + string(i) + "/securityContext",
+              value: Object.spec.initContainers.securityContext{
+                capabilities: Object.spec.initContainers.securityContext.capabilities{drop: ["NET_RAW"]}}} :
+          !has(object.spec.initContainers[i].securityContext.capabilities) ?
+            JSONPatch{op: "add", path: "/spec/initContainers/" + string(i) + "/securityContext/capabilities",
+              value: Object.spec.initContainers.securityContext.capabilities{drop: ["NET_RAW"]}} :
+          !has(object.spec.initContainers[i].securityContext.capabilities.drop) ?
+            JSONPatch{op: "add", path: "/spec/initContainers/" + string(i) + "/securityContext/capabilities/drop",
+              value: ["NET_RAW"]} :
+            JSONPatch{op: "add", path: "/spec/initContainers/" + string(i) + "/securityContext/capabilities/drop/-",
+              value: "NET_RAW"}) : [])
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: tenant-drop-net-raw
+spec:
+  policyName: tenant-drop-net-raw
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        arc-on-nas/tenant: "true"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: tenant-pod-rules
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+  variables:
+    - name: containers
+      expression: >-
+        object.spec.containers +
+        (has(object.spec.initContainers) ? object.spec.initContainers : []) +
+        (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])
+  validations:
+    - expression: >-
+        variables.containers.all(c, has(c.securityContext) && has(c.securityContext.capabilities) &&
+        has(c.securityContext.capabilities.drop) &&
+        c.securityContext.capabilities.drop.exists(d, d == 'ALL' || d == 'NET_RAW'))
+      message: tenant namespaces require every container to drop the NET_RAW capability (or ALL)
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v,
+        has(v.configMap) || has(v.downwardAPI) || has(v.emptyDir) || has(v.ephemeral) ||
+        has(v.persistentVolumeClaim) || has(v.projected) || has(v.secret))
+      message: >-
+        tenant namespaces allow only these volume types: configMap, downwardAPI, emptyDir,
+        ephemeral, persistentVolumeClaim, projected, secret
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: tenant-pod-rules
+spec:
+  policyName: tenant-pod-rules
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        arc-on-nas/tenant: "true"
+---
+# On updates too: a pod's image may be changed in place, and the kubelet then pulls the new one.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: tenant-pod-images
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods, pods/ephemeralcontainers]
+  variables:
+    - name: containers
+      expression: >-
+        object.spec.containers +
+        (has(object.spec.initContainers) ? object.spec.initContainers : []) +
+        (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])
+    # On an update, only a container whose image changed: a pod admitted before these policies
+    # must stay updatable (a finalizer removed, say).
+    - name: oldImages
+      expression: >-
+        oldObject == null ? [] : (oldObject.spec.containers +
+        (has(oldObject.spec.initContainers) ? oldObject.spec.initContainers : []) +
+        (has(oldObject.spec.ephemeralContainers) ? oldObject.spec.ephemeralContainers : [])
+        ).map(c, c.name + '=' + c.image)
+  validations:
+    # The registry is the part before the first "/" when it holds a "." or ":" or is localhost.
+    - expression: >-
+        variables.containers.all(c, (c.name + '=' + c.image) in variables.oldImages || (
+        !c.image.matches('(?i)^(([^/]*\\.)?localhost\\.?|[0-9.]+|\\[[^/]*\\])(:[0-9]+)?/') &&
+        !c.image.matches('(?i)^[^/]*\\.(svc|cluster\\.local)([.:/])')))
+      message: >-
+        tenant namespaces pull images only from registries on the internet: not from localhost,
+        an IP address or a cluster Service
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: tenant-pod-images
+spec:
+  policyName: tenant-pod-images
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        arc-on-nas/tenant: "true"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: tenant-service-external-ips
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [services]
+  validations:
+    - expression: "!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0"
+      message: tenant namespaces allow no Service with spec.externalIPs
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: tenant-service-external-ips
+spec:
+  policyName: tenant-service-external-ips
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        arc-on-nas/tenant: "true"
