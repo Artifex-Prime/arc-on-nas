@@ -107,6 +107,30 @@ grep -qE "$(image_re swift "$swift-$runner(-ubuntu26.04-node$node)?")" helm/swif
 grep -qE "$(image_re ubuntu "$runner(-node$node)?")" helm/ubuntu.yaml || problem "helm/ubuntu.yaml: image tag is not $runner"
 grep -qE "$(image_re browser "$runner-node$node")" helm/browser.yaml || problem "helm/browser.yaml: image tag is not $runner-node$node"
 
+# The build farm's cache (README, "Tenant namespaces"): the volume and the claim name each other,
+# and Buildbarn's files (build-farm/cache.libsonnet) together stay below the volume's capacity,
+# which is the host directory's quota.
+farm_pv=manifests/tenants/build-farm/cache-volume.yaml
+farm_pvc=manifests/tenants/build-farm/cache-claim.yaml
+pv_name=$(yq '.metadata.name' "$farm_pv")
+pvc_name=$(yq '.metadata.name' "$farm_pvc")
+[ "$(yq '.spec.claimRef.namespace + "/" + .spec.claimRef.name' "$farm_pv")" = "build-farm/$pvc_name" ] \
+  || problem "$farm_pv: claimRef is not build-farm/$pvc_name"
+[ "$(yq '.spec.volumeName' "$farm_pvc")" = "$pv_name" ] || problem "$farm_pvc: volumeName is not $pv_name"
+capacity=$(yq '.spec.capacity.storage' "$farm_pv")
+[ "$(yq '.spec.resources.requests.storage' "$farm_pvc")" = "$capacity" ] \
+  || problem "$farm_pvc: the requested size is not the volume's $capacity"
+case "$capacity" in
+  *Gi) capacity_bytes=$(( ${capacity%Gi} * 1024 * 1024 * 1024 )) ;;
+  *) problem "$farm_pv: capacity $capacity is not in Gi"; capacity_bytes=0 ;;
+esac
+# shellcheck disable=SC2016 # $x is yq's variable
+cache_bytes=$(jsonnet build-farm/cache.libsonnet \
+  | yq -p json '[.. | select(tag == "!!map" and has("sizeBytes")) | .sizeBytes] | .[] as $x ireduce (0; . + $x)')
+echo "build farm cache: $cache_bytes bytes of files, volume $capacity"
+[ "$cache_bytes" -gt 0 ] && [ "$cache_bytes" -lt "$capacity_bytes" ] \
+  || problem "build-farm/cache.libsonnet: the files' total $cache_bytes bytes is not below $capacity ($farm_pv)"
+
 # Helper images used by more than one script.
 alpine_pre=$(sed -n 's/^test_image=//p' scripts/preflight.sh)
 alpine_trial=$(sed -n 's/^pod_image=//p' scripts/trial.sh)

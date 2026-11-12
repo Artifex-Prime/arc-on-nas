@@ -294,6 +294,20 @@ jobs:
             a=$(can $q); echo "can $q: $a"; [ "$a" = no ]
           done
 
+          # The build farm's cache volume binds to its claim, and a claim in another tenant's namespace
+          # that names it stays unbound (manifests/tenants/build-farm/cache-volume.yaml, claimRef).
+          k -n build-farm wait --for=jsonpath='{.status.phase}'=Bound pvc/cache --timeout=60s
+          b=$(k get pv build-farm-cache -o jsonpath='{.spec.claimRef.namespace}/{.spec.claimRef.name}')
+          echo "build-farm-cache bound to $b"; [ "$b" = build-farm/cache ]
+          k --as "$u" --as-group devinfra -n zuul-trial apply -f - <<< '{"apiVersion":"v1",
+            "kind":"PersistentVolumeClaim","metadata":{"name":"other-cache"},"spec":{"accessModes":
+            ["ReadWriteOnce"],"storageClassName":"","volumeName":"build-farm-cache",
+            "resources":{"requests":{"storage":"1Gi"}}}}'
+          if k -n zuul-trial wait --for=jsonpath='{.status.phase}'=Bound pvc/other-cache --timeout=15s; then
+            echo "a zuul-trial claim got build-farm-cache" >&2; exit 1
+          fi
+          k -n zuul-trial delete pvc other-cache
+
           # What admission refuses: each must fail, with the reason in its message.
           refused() {
             local why=$1; shift
