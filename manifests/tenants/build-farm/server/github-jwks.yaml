@@ -1,0 +1,60 @@
+# GitHub's OIDC signing keys for the frontend (config/auth.libsonnet), kept current in the
+# ConfigMap github-jwks by bb-storage's sync_jwks_to_configmap (config/github-jwks.jsonnet) every
+# 15 minutes. GitHub publishes a new key before it signs with it, and the frontend reads the file
+# again every 5 minutes, so a new key is known before a job's token is signed with it.
+#
+# The job is the one pod in build-farm that reaches the API server: the admin's Role lets its
+# ServiceAccount read and patch that one ConfigMap and nothing else, and the admin's
+# NetworkPolicy lets pods with its label reach the API (../github-jwks.yaml). The ConfigMap itself
+# is the tenant's to make once, before the frontend (README, "The build farm's credentials").
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: github-jwks
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: github-jwks
+  labels:
+    app.kubernetes.io/name: github-jwks
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: github-jwks
+        spec:
+          serviceAccountName: github-jwks
+          enableServiceLinks: false
+          restartPolicy: Never
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: sync
+              # yamllint disable-line rule:line-length
+              image: ghcr.io/buildbarn/sync-jwks-to-configmap:20261102T091443Z-ca3d8b4@sha256:f28103520663fd0c926ed3a2263f48069fd5e867dd2203e7f94905d1277b1e89
+              args: [/config/github-jwks.jsonnet]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              resources:
+                requests: {cpu: 10m, memory: 32Mi, ephemeral-storage: 16Mi}
+                limits: {cpu: 200m, memory: 64Mi, ephemeral-storage: 64Mi}
+              volumeMounts:
+                - {name: config, mountPath: /config, readOnly: true}
+          volumes:
+            - name: config
+              configMap: {name: buildbarn-config}

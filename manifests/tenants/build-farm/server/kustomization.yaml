@@ -1,7 +1,9 @@
-# The build farm's server: Buildbarn's storage, frontend and scheduler in build-farm (README,
-# "Tenant namespaces", "The build farm's server"). Namespaced only, so the tenant applies it with
-# their own certificate, after the admin has applied ../ (the namespace, its quota, the cache's
-# volume) and the claim `cache` is bound:
+# The build farm's server: Buildbarn's storage, frontend and scheduler in build-farm, and the job
+# that keeps GitHub's keys for the frontend (README, "Tenant namespaces", "The build farm's
+# server", "The build farm's credentials"). Namespaced only, so the tenant applies it with their
+# own certificate, after the admin has applied ../ (the namespace, its quota, the cache's volume,
+# the job's API access), the claim `cache` is bound, and the frontend's Secret and two ConfigMaps
+# exist (frontend.yaml):
 #   kubectl -n build-farm apply -k manifests/tenants/build-farm/server
 # Not part of ../kustomization.yaml, which the admin applies.
 #
@@ -21,12 +23,16 @@ resources:
   - storage.yaml
   - scheduler.yaml
   - frontend.yaml
+  - github-jwks.yaml
 configMapGenerator:
   - name: buildbarn-config
     files:
+      - config/auth.libsonnet
       - config/cache.libsonnet
+      - config/clients.libsonnet
       - config/common.libsonnet
       - config/topology.libsonnet
       - config/storage.jsonnet
       - config/frontend.jsonnet
       - config/scheduler.jsonnet
+      - config/github-jwks.jsonnet

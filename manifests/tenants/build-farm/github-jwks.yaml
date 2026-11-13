@@ -1,0 +1,51 @@
+# What the CronJob github-jwks (server/github-jwks.yaml) needs from the admin: GitHub's OIDC signing
+# keys go into the ConfigMap github-jwks, for the frontend (README, "The build farm's
+# credentials"). A tenant can't grant either of these to itself (../base/role.yaml).
+#
+#   The Role: its ServiceAccount may read and patch that one ConfigMap, nothing else. The tenant
+#     may already do as much; what the grant adds is that the job does it without a person.
+#   The NetworkPolicy: pods with its label reach the API server, which base's egress-not-host
+#     keeps every tenant pod from (policies add up). The address is the node's: the API's Service,
+#     kubernetes.default, leads there, and the policy sees the packet after kube-proxy has
+#     rewritten it. The tenant chooses its pods' labels, so any pod of its own may carry this one;
+#     it then reaches the API with that pod's ServiceAccount, which can do no more than above.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: github-jwks
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [github-jwks]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: github-jwks
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: github-jwks
+subjects:
+  - kind: ServiceAccount
+    name: github-jwks
+    namespace: build-farm
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: github-jwks-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: github-jwks
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 172.31.250.10/32
+      ports:
+        - protocol: TCP
+          port: 6443

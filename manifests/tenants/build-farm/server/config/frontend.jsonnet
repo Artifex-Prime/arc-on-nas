@@ -1,7 +1,9 @@
 // The frontend (../frontend.yaml): the one address clients use, `frontend:8980`, for the remote
 // cache (CAS, action cache) and remote execution. It passes cache requests to the storage pod and
 // execution requests to the scheduler. Clients reach it from other namespaces and from outside the
-// cluster (README, "Tenant namespaces", "The build farm's network"), so it speaks TLS only.
+// cluster (README, "Tenant namespaces", "The build farm's network"), so it speaks TLS only, and
+// every request carries a credential (auth.libsonnet; README, "The build farm's credentials").
+local auth = import 'auth.libsonnet';
 local common = import 'common.libsonnet';
 local topology = import 'topology.libsonnet';
 
@@ -17,7 +19,7 @@ local existenceCache = {
 {
   grpcServers: [{
     listenAddresses: [':8980'],
-    authenticationPolicy: common.allowAll,
+    authenticationPolicy: auth.policy,
     // The key pair from the Secret frontend-tls (scripts/farm-tls.sh), read again every minute: a
     // renewed Secret reaches the pod's volume within about two minutes, and is served from then
     // on with no restart. bb-storage reports each certificate's expiry in its metrics
@@ -57,9 +59,9 @@ local existenceCache = {
       chunkMappingStorage: { existenceCaching: { backend: topology.chunkMappingStorage, existenceCache: existenceCache } },
       cdcParameterCache: topology.cdcParameterCache,
     },
-    getAuthorizer: common.allowAll,
-    putAuthorizer: common.allowAll,
-    findMissingAuthorizer: common.allowAll,
+    getAuthorizer: auth.authorizer,
+    putAuthorizer: auth.authorizer,
+    findMissingAuthorizer: auth.authorizer,
     maximumChunkCount: 100000,
   },
   // No client writes an action result or a file system access profile: the workers compute them
@@ -67,13 +69,16 @@ local existenceCache = {
   // blob in the CAS is named by its hash, so a client's upload of one cannot be wrong.
   actionCache: {
     backend: topology.actionCache,
-    getAuthorizer: common.allowAll,
+    getAuthorizer: auth.authorizer,
     putAuthorizer: common.denyAll,
   },
   fileSystemAccessCache: {
     backend: topology.fileSystemAccessCache,
-    getAuthorizer: common.allowAll,
+    getAuthorizer: auth.authorizer,
     putAuthorizer: common.denyAll,
   },
-  executeAuthorizer: common.allowAll,
+  // Execute only. WaitExecution reaches the scheduler with no authorization here (bb_storage.proto),
+  // and the scheduler authorizes nobody yet: a client that knows an operation's name could watch
+  // it. That is for the workers' turn (README, "The build farm's credentials").
+  executeAuthorizer: auth.authorizer,
 }

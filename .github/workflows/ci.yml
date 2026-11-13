@@ -15,7 +15,10 @@ name: CI
 #        api-forward.yml, the tenant NetworkPolicies against each target, with controls, and the
 #        build farm's server: applied by the tenant with a key pair from scripts/farm-tls.sh, a
 #        cache write and read through its frontend over TLS (no plain text, no client's action
-#        result), a restart of its storage pod that keeps them, and its network: the frontend
+#        result), a restart of its storage pod that keeps them, its credentials: CI's and the
+#        clients' tokens against each instance name, a client revoked and restored and a key
+#        rotated with the cache warm, GitHub's real keys fetched by the CronJob and its narrow API
+#        access, and its network: the frontend
 #        reached from a runner pod and through farm-forward.yml, refused to the other tenant,
 #        another namespace, the host and another address on the stack network, at the NodePort
 #        and at the forwarder's addresses, and a renewed certificate served without a restart.
@@ -176,9 +179,9 @@ jobs:
     name: Smoke test
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
-    # Above the sum of the waits below (about 28 minutes), so a slow day ends in a wait's own error
-    # and the diagnostics; a normal run takes about 4 minutes.
-    timeout-minutes: 32
+    # Above the sum of the waits below (about 41 minutes), so a slow day ends in a wait's own error
+    # and the diagnostics; a normal run takes about 7 minutes.
+    timeout-minutes: 45
     env:
       CHART_VERSION: "0.15.0"
       CHARTS: oci://ghcr.io/actions/actions-runner-controller-charts
@@ -658,6 +661,26 @@ jobs:
           for ns in build-farm arc-runners zuul-trial default; do
             k -n "$ns" create configmap build-farm-ca --from-literal=ca.crt="$ca"
           done
+          # The frontend's credentials, as the tenant makes them (README, "The build farm's
+          # credentials"): the revoked clients, none, and GitHub's keys. Those start as a stand-in
+          # key of this test's own, so that it can sign CI's tokens; the next step fetches GitHub's
+          # real ones. A client of the test's own, `smoke-box`, takes the place of the real ones in
+          # clients.libsonnet, which the node sees through its mount of manifests/.
+          keys=$RUNNER_TEMP/farm-keys
+          install -d -m 700 "$keys"
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          public() { openssl pkey -in "$1" -pubout -outform DER | tail -c 32 | b64url; }
+          for key in github box box-new; do openssl genpkey -algorithm ed25519 -out "$keys/$key.key"; done
+          jwks=$(jq -nc --arg x "$(public "$keys/github.key")" \
+            '{keys: [{kty: "OKP", crv: "Ed25519", x: $x, kid: "stand-in"}]}')
+          jq -n --arg v "$(printf %s "$jwks" | base64 -w0)" \
+            '{apiVersion: "v1", kind: "ConfigMap", metadata: {name: "github-jwks"}, binaryData: {"jwks.json": $v}}' \
+            | tk create -f -
+          tk create configmap farm-revoked --from-literal=revoked=,
+          clients=manifests/tenants/build-farm/server/config/clients.libsonnet
+          entry="    'smoke-box': [{ kty: 'OKP', crv: 'Ed25519', x: '$(public "$keys/box.key")' }],"
+          sed -i "/^  keys: {\$/,/^  },\$/c\\  keys: {\n$entry\n  }," "$clients"
+          sed -n '/^  keys: {$/,/^  },$/p' "$clients"
           # Applied by the tenant, as on a host.
           server=/opt/arc-on-nas/manifests/tenants/build-farm/server
           tk apply -k "$server"
@@ -678,10 +701,26 @@ jobs:
                 securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}}}]}}' \
             | tk apply -f -
           k -n build-farm wait --for=condition=Ready pod/client --timeout=180s
-          # call <method> <request>: one gRPC call to the frontend's Service from the client, over
-          # TLS with the farm's CA, the method found by the server's reflection service; prints
-          # the response. store: the same to the storage pod, which only the namespace reaches.
-          call() { k -n build-farm exec client -- grpcurl -cacert /ca/ca.crt -max-time 20 -d "$2" frontend:8980 "$1"; }
+          # jwt <key> <claims>: a token with these claims, signed with that Ed25519 key, as a box's
+          # credential helper and GitHub sign theirs.
+          jwt() {
+            local h p
+            h=$(printf '{"alg":"EdDSA","typ":"JWT"}' | b64url)
+            p=$(printf %s "$2" | b64url)
+            printf %s "$h.$p" > "$RUNNER_TEMP/jwt-input"
+            echo "$h.$p.$(openssl pkeyutl -sign -inkey "$1" -rawin -in "$RUNNER_TEMP/jwt-input" | b64url)"
+          }
+          now=$(date +%s)
+          box=$(jwt "$keys/box.key" \
+            "{\"aud\":\"aid-build-farm\",\"sub\":\"smoke-box\",\"iat\":$now,\"exp\":$((now + 3600))}")
+          # call <method> <request> [token]: one gRPC call to the frontend's Service from the client,
+          # over TLS with the farm's CA and a credential (the box's unless another is given), the
+          # method found by the server's reflection service; prints the response. store: the same to
+          # the storage pod, which only the namespace reaches, with no credential.
+          call() {
+            k -n build-farm exec client -- grpcurl -cacert /ca/ca.crt -max-time 20 \
+              -H "authorization: Bearer ${3:-$box}" -d "$2" frontend:8980 "$1"
+          }
           store() {
             k -n build-farm exec client -- grpcurl -plaintext -max-time 20 -d "$2" storage-0.storage:8981 "$1"
           }
@@ -694,8 +733,8 @@ jobs:
           }
           retry call grpc.health.v1.Health/Check '{}'
           # No plain-text gRPC on the frontend.
-          if k -n build-farm exec client -- grpcurl -plaintext -max-time 10 frontend:8980 \
-               grpc.health.v1.Health/Check; then
+          if k -n build-farm exec client -- grpcurl -plaintext -max-time 10 -H "authorization: Bearer $box" \
+               frontend:8980 grpc.health.v1.Health/Check; then
             echo "the frontend answered without TLS" >&2; exit 1
           fi
           echo "the frontend without TLS: refused"
@@ -704,20 +743,24 @@ jobs:
           b64=$(printf %s "$data" | base64 -w0)
           digest=$(jq -nc --arg h "$(printf %s "$data" | sha256sum | cut -d' ' -f1)" --argjson s "${#data}" \
             '{hash: $h, size_bytes: $s}')
-          result="{\"action_digest\":$digest,\"action_result\":{\"exit_code\":42,\"stdout_raw\":\"$b64\"}}"
+          # Under the instance name `dev`, the box's: a client may use no other (README, "The build
+          # farm's credentials"). The next step checks who may use which.
+          result=$(jq -nc --argjson d "$digest" --arg b "$b64" \
+            '{instance_name: "dev", action_digest: $d, action_result: {exit_code: 42, stdout_raw: $b}}')
           # check <when>: the blob and the action result read back through the frontend. Each step
           # returns on failure itself: under retry, set -e does not apply inside it.
           check() {
             local got
-            got=$(call "$re.ContentAddressableStorage/BatchReadBlobs" "{\"digests\":[$digest]}" \
-              | jq -r '.responses[0].data') || return 1
+            got=$(call "$re.ContentAddressableStorage/BatchReadBlobs" \
+              "{\"instance_name\":\"dev\",\"digests\":[$digest]}" | jq -r '.responses[0].data') || return 1
             echo "$1, the blob read back: $(base64 -d <<< "$got")"; [ "$got" = "$b64" ] || return 1
-            got=$(call "$re.ActionCache/GetActionResult" "{\"action_digest\":$digest}" \
-              | jq -c '[.exitCode, .stdoutRaw]') || return 1
+            got=$(call "$re.ActionCache/GetActionResult" \
+              "{\"instance_name\":\"dev\",\"action_digest\":$digest}" | jq -c '[.exitCode, .stdoutRaw]') || return 1
             echo "$1, the action result: $got"; [ "$got" = "[42,\"$b64\"]" ] || return 1
           }
           call "$re.ContentAddressableStorage/BatchUpdateBlobs" \
-            "{\"requests\":[{\"digest\":$digest,\"data\":\"$b64\"}]}"
+            "{\"instance_name\":\"dev\",\"requests\":[{\"digest\":$digest,\"data\":\"$b64\"}]}" \
+            | jq -e '.responses[0].status.code // 0 | . == 0' > /dev/null
           # A client may not write an action result through the frontend; the workers write them to
           # the storage pod, as this does.
           if call "$re.ActionCache/UpdateActionResult" "$result" 2> "$RUNNER_TEMP/out.txt"; then
@@ -740,11 +783,180 @@ jobs:
           k -n build-farm logs storage-0
           k -n build-farm delete pod client --wait=false
 
+      - name: The build farm's credentials
+        run: |
+          set -euo pipefail
+          k() { docker compose exec -T k3s kubectl "$@"; }
+          u=opifex-magnus
+          tk() { k --as "$u" --as-group devinfra -n build-farm "$@"; }
+          # Who may do what (README, "The build farm's credentials"): CI's tokens, signed with the
+          # previous step's stand-in for GitHub's key, and the clients' own, each against the
+          # instance names `main` and `dev`; a revocation and a key rotation with no restart of
+          # anything else; then GitHub's real keys, fetched by the CronJob through the proxy.
+          keys=$RUNNER_TEMP/farm-keys
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          public() { openssl pkey -in "$1" -pubout -outform DER | tail -c 32 | b64url; }
+          jwt() {
+            local h p
+            h=$(printf '{"alg":"EdDSA","typ":"JWT"}' | b64url)
+            p=$(printf %s "$2" | b64url)
+            printf %s "$h.$p" > "$RUNNER_TEMP/jwt-input"
+            echo "$h.$p.$(openssl pkeyutl -sign -inkey "$1" -rawin -in "$RUNNER_TEMP/jwt-input" | b64url)"
+          }
+          now=$(date +%s)
+          # client <key> [claims]: a client's own token for `smoke-box`, valid for an hour.
+          client() {
+            jwt "$1" "$(jq -nc --argjson n "$now" --argjson more "${2:-"{}"}" \
+              '{aud: "aid-build-farm", sub: "smoke-box", iat: $n, exp: ($n + 3600)} + $more')"
+          }
+          # ci <claims>: GitHub's token for a job of AIDepartment's on a self-hosted runner.
+          ci() {
+            jwt "$keys/github.key" "$(jq -nc --argjson n "$now" --argjson more "$1" '{
+              iss: "https://token.actions.githubusercontent.com", aud: "aid-build-farm",
+              repository: "kristofk/AIDepartment", runner_environment: "self-hosted",
+              jti: "smoke", iat: $n, nbf: $n, exp: ($n + 600)} + $more')"
+          }
+          ci_yml=kristofk/AIDepartment/.github/workflows/ci.yml
+          queue=$(ci '{"actor":"mergify[bot]","event_name":"pull_request","ref":"refs/pull/1500/merge",
+            "head_ref":"mergify/merge-queue/0f1e2d","workflow_ref":"'"$ci_yml"'@refs/pull/1500/merge",
+            "job_workflow_ref":"'"$ci_yml"'@refs/pull/1500/merge"}')
+          pr=$(ci '{"actor":"Artifex-Prime","event_name":"pull_request","ref":"refs/pull/1501/merge",
+            "head_ref":"artifex-issue-1501","workflow_ref":"'"$ci_yml"'@refs/pull/1501/merge"}')
+          manual=$(ci '{"actor":"kristofk","event_name":"workflow_dispatch","ref":"refs/heads/main",
+            "workflow_ref":"'"$ci_yml"'@refs/heads/main"}')
+          fork=$(ci '{"actor":"stranger","runner_environment":"github-hosted","event_name":"pull_request",
+            "ref":"refs/pull/1502/merge","head_ref":"main","workflow_ref":"'"$ci_yml"'@refs/pull/1502/merge"}')
+          box=$(client "$keys/box.key")
+          unknown=$(client "$keys/box-new.key")
+          expired=$(client "$keys/box.key" '{"iat":'"$((now - 7200))"',"exp":'"$((now - 3600))"'}')
+          impostor=$(client "$keys/box.key" '{"sub":"artifex-prime"}')
+          jq -n --arg image "$GRPCURL_IMAGE" '
+            {apiVersion: "v1", kind: "Pod", metadata: {name: "creds"}, spec: {
+              automountServiceAccountToken: false,
+              securityContext: {runAsUser: 65532, runAsGroup: 65532, runAsNonRoot: true,
+                seccompProfile: {type: "RuntimeDefault"}},
+              volumes: [{name: "ca", configMap: {name: "build-farm-ca"}}],
+              containers: [{name: "c", image: $image, command: ["sleep", "900"],
+                volumeMounts: [{name: "ca", mountPath: "/ca", readOnly: true}],
+                securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}}}]}}' \
+            | tk apply -f -
+          k -n build-farm wait --for=condition=Ready pod/creds --timeout=180s
+          re=build.bazel.remote.execution.v2
+          # rpc <token> <method> <request>: prints `OK`, or the gRPC code the frontend answered, for
+          # the call or, in a batch, for its first item.
+          rpc() {
+            local out
+            if out=$(k -n build-farm exec creds -- grpcurl -cacert /ca/ca.crt -max-time 20 \
+                       ${1:+-H "authorization: Bearer $1"} -d "$3" frontend:8980 "$2" 2>&1); then
+              printf %s "$out" \
+                | jq -rs '(.[0].responses[0].status.code // 0) as $c | if $c == 0 then "OK" else "code \($c)" end'
+            else
+              # "Code: X" for the call's own error; "code = X" when the reflection call before it failed.
+              grep -o -m 1 -E 'Code: [A-Za-z]+|code = [A-Za-z]+' <<< "$out" | sed -E 's/^(Code: |code = )//' | grep . \
+                || { echo "$out" >&2; echo failed; }
+            fi
+          }
+          # put <token> <instance>: a new blob written under that instance name.
+          put() {
+            local data b64 d
+            data="arc-on-nas credentials $2 $(date +%s%N)"
+            b64=$(printf %s "$data" | base64 -w0)
+            d=$(jq -nc --arg h "$(printf %s "$data" | sha256sum | cut -d' ' -f1)" --argjson s "${#data}" \
+              '{hash: $h, size_bytes: $s}')
+            rpc "$1" "$re.ContentAddressableStorage/BatchUpdateBlobs" \
+              "{\"instance_name\":\"$2\",\"requests\":[{\"digest\":$d,\"data\":\"$b64\"}]}"
+          }
+          # expect <what> <want> <got>
+          expect() { echo "$1: $3 (want $2)"; [ "$3" = "$2" ]; }
+          # PermissionDenied is code 7 inside a batch's answer, and the code's name for a call.
+          denied="code 7"
+          expect "the merge queue's run, main" OK "$(put "$queue" main)"
+          expect "the merge queue's run, dev" "$denied" "$(put "$queue" dev)"
+          expect "a manual run on main, main" OK "$(put "$manual" main)"
+          expect "a pull request's run, dev" OK "$(put "$pr" dev)"
+          expect "a pull request's run, main" "$denied" "$(put "$pr" main)"
+          expect "a box, dev" OK "$(put "$box" dev)"
+          expect "a box, main" "$denied" "$(put "$box" main)"
+          expect "a box, no instance name" "$denied" "$(put "$box" "")"
+          expect "a fork's run" Unauthenticated "$(put "$fork" dev)"
+          expect "no credential" Unauthenticated "$(put "" dev)"
+          expect "a key the farm doesn't know" Unauthenticated "$(put "$unknown" dev)"
+          expect "an expired token" Unauthenticated "$(put "$expired" dev)"
+          expect "the box's key, another client's name" Unauthenticated "$(put "$impostor" dev)"
+          # No client writes an action result, trusted CI included; and no client executes under
+          # another tier's instance name.
+          x=$(jq -nc --arg h "$(printf x | sha256sum | cut -d' ' -f1)" '{hash: $h, size_bytes: 1}')
+          ac=$(jq -nc --argjson d "$x" '{instance_name: "main", action_digest: $d, action_result: {exit_code: 0}}')
+          expect "the merge queue's run, an action result" PermissionDenied \
+            "$(rpc "$queue" "$re.ActionCache/UpdateActionResult" "$ac")"
+          exe=$(jq -nc --argjson d "$x" '{instance_name: "main", action_digest: $d}')
+          expect "a box, Execute under main" PermissionDenied "$(rpc "$box" "$re.Execution/Execute" "$exe")"
+
+          # Revoking a client: its name in farm-revoked, with its token in the frontend's cache. The
+          # kubelet updates the file within about a minute or two, the frontend reads it every minute.
+          restarts() {
+            k -n build-farm get pods -l app.kubernetes.io/name=frontend \
+              -o jsonpath='{.items[*].status.containerStatuses[0].restartCount}'
+          }
+          before=$(restarts)
+          tk patch configmap farm-revoked -p '{"data":{"revoked":",mac,smoke-box,"}}'
+          got=""
+          for _ in $(seq 1 60); do got=$(put "$box" dev); [ "$got" = "$denied" ] && break; sleep 5; done
+          expect "a box, revoked" "$denied" "$got"
+          expect "a pull request's run, beside the revoked box" OK "$(put "$pr" dev)"
+          tk patch configmap farm-revoked -p '{"data":{"revoked":","}}'
+          for _ in $(seq 1 60); do got=$(put "$box" dev); [ "$got" = OK ] && break; sleep 5; done
+          expect "a box, no longer revoked" OK "$got"
+          expect "frontend restarts" "$before" "$(restarts)"
+
+          # Rotating a client's key: its new public key in clients.libsonnet instead of the old one,
+          # applied as any change of the server. The frontend restarts with it, and its cache with it.
+          clients=manifests/tenants/build-farm/server/config/clients.libsonnet
+          sed -i "s|x: '$(public "$keys/box.key")'|x: '$(public "$keys/box-new.key")'|" "$clients"
+          tk apply -k /opt/arc-on-nas/manifests/tenants/build-farm/server
+          k -n build-farm rollout status deployment/frontend --timeout=180s
+          for _ in $(seq 1 20); do got=$(put "$unknown" dev); [ "$got" = OK ] && break; sleep 3; done
+          expect "the new key" OK "$got"
+          expect "the old key" Unauthenticated "$(put "$box" dev)"
+
+          # GitHub's real keys, fetched once by hand through the proxy, as the CronJob does every 15
+          # minutes. Its ServiceAccount may patch that ConfigMap and no other, and only its pods
+          # reach the API server.
+          tk create job --from=cronjob/github-jwks jwks-now
+          k -n build-farm wait --for=condition=Complete job/jwks-now --timeout=180s || {
+            k -n build-farm logs job/jwks-now >&2; exit 1; }
+          k -n build-farm get configmap github-jwks -o jsonpath='{.binaryData.jwks\.json}' | base64 -d \
+            > "$RUNNER_TEMP/github-jwks.json"
+          jq -c '[.keys[] | {kty, kid}]' "$RUNNER_TEMP/github-jwks.json"
+          jq -e '(.keys | length) > 0 and all(.keys[]; .kty == "RSA") and all(.keys[]; .kid != "stand-in")' \
+            "$RUNNER_TEMP/github-jwks.json" > /dev/null
+          sa=system:serviceaccount:build-farm:github-jwks
+          can() { k -n build-farm auth can-i "$@" --as "$sa" || true; }
+          expect "the job may patch github-jwks" yes "$(can patch configmaps/github-jwks)"
+          expect "the job may patch farm-revoked" no "$(can patch configmaps/farm-revoked)"
+          expect "the job may create a ConfigMap" no "$(can create configmaps)"
+          k -n build-farm exec creds -- grpcurl -insecure -max-time 10 172.31.250.10:6443 list \
+            > "$RUNNER_TEMP/api.txt" 2>&1 || true
+          if ! grep -q 'Failed to dial target host' "$RUNNER_TEMP/api.txt"; then
+            echo "another pod in build-farm reached the API: $(cat "$RUNNER_TEMP/api.txt")" >&2; exit 1
+          fi
+          echo "another pod in build-farm -> the API: refused"
+          k -n build-farm delete pod creds --wait=false
+
       - name: The build farm's network and TLS
         run: |
           set -euo pipefail
           k() { docker compose exec -T k3s kubectl "$@"; }
           u=opifex-magnus
+          # A box's token for the health checks below, signed with the key the previous step rotated to.
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          now=$(date +%s)
+          h=$(printf '{"alg":"EdDSA","typ":"JWT"}' | b64url)
+          p=$(printf '{"aud":"aid-build-farm","sub":"smoke-box","iat":%s,"exp":%s}' "$now" "$((now + 3600))" | b64url)
+          printf %s "$h.$p" > "$RUNNER_TEMP/jwt-input"
+          s=$(openssl pkeyutl -sign -inkey "$RUNNER_TEMP/farm-keys/box-new.key" -rawin -in "$RUNNER_TEMP/jwt-input" \
+            | b64url)
+          box="$h.$p.$s"
           # Who reaches the frontend (README, "The build farm's network"): a runner pod through the
           # cluster's DNS, a container on another Docker network through the forwarder, and nothing
           # else: not the other tenant, not another namespace, not the host, not another address on
@@ -775,7 +987,8 @@ jobs:
           done
           # health <namespace> <address>: the frontend's health over TLS from that namespace's pod.
           health() {
-            k -n "$1" exec farm-client -- grpcurl -cacert /ca/ca.crt -max-time 10 "$2" grpc.health.v1.Health/Check 2>&1
+            k -n "$1" exec farm-client -- grpcurl -cacert /ca/ca.crt -max-time 10 -H "authorization: Bearer $box" "$2" \
+              grpc.health.v1.Health/Check 2>&1
           }
           # reaches <namespace> <address>: it answers SERVING (after a minute of retries at most:
           # a new pod's address reaches the policies a little after it is ready).
@@ -819,7 +1032,7 @@ jobs:
           # blob the previous step wrote.
           far() {
             docker run --rm --network farm-test -v "$RUNNER_TEMP/farm-ca-public:/t:ro" "$GRPCURL_IMAGE" \
-              -cacert /t/ca.crt -max-time 10 "$@"
+              -cacert /t/ca.crt -max-time 10 -H "authorization: Bearer $box" "$@"
           }
           for _ in $(seq 1 20); do far build-farm:8980 grpc.health.v1.Health/Check && break; sleep 3; done
           far build-farm:8980 grpc.health.v1.Health/Check | grep -q SERVING

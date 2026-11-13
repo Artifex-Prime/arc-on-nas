@@ -21,9 +21,10 @@
     },
   },
 
-  // Who may connect. Everyone that reaches the port: the namespace's NetworkPolicies let in only
-  // the namespace's own pods (../../../base/networkpolicy.yaml), and to the frontend also the
-  // runners and the forwarder (../../networkpolicy.yaml). Per-client credentials come later.
+  // Who may connect to the storage pod and the scheduler: everyone that reaches the port. The
+  // namespace's NetworkPolicies let in only the namespace's own pods
+  // (../../../base/networkpolicy.yaml). The frontend, which the runners and the forwarder reach too
+  // (../../networkpolicy.yaml), takes a credential from every client instead (auth.libsonnet).
   allowAll: { allow: {} },
   denyAll: { deny: {} },
 }

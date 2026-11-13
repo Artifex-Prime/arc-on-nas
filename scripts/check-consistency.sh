@@ -188,6 +188,42 @@ done
 grep -q "^secret=$tls_secret$" scripts/farm-tls.sh || problem "scripts/farm-tls.sh: the default Secret is not $tls_secret"
 echo "build farm network: $farm_fwd -> $node_ip:$node_port, alias $alias, key pair $tls_secret at $tls_mount"
 
+# The build farm's credentials (README, "The build farm's credentials"): the frontend reads GitHub's
+# keys and the revoked clients where their ConfigMaps are mounted; the job that keeps GitHub's keys
+# runs bb-storage's version, writes the ConfigMap the frontend mounts, goes through the proxy, and
+# is the pods the admin's NetworkPolicy lets reach the node's API port.
+farm_auth=manifests/tenants/build-farm/server/config/auth.libsonnet
+farm_jwks=manifests/tenants/build-farm/server/github-jwks.yaml
+farm_jwks_config=manifests/tenants/build-farm/server/config/github-jwks.jsonnet
+farm_jwks_admin=manifests/tenants/build-farm/github-jwks.yaml
+mount_of() {
+  local v
+  v=$(yq "select(.kind == \"Deployment\") | .spec.template.spec.volumes[] | select(.configMap.name == \"$1\") | .name" "$farm_frontend")
+  yq "select(.kind == \"Deployment\") | .spec.template.spec.containers[] | .volumeMounts[] | select(.name == \"$v\") | .mountPath" "$farm_frontend"
+}
+jwks_path=$(jsonnet -e "(import '$farm_auth').paths.githubJwks" | yq -p json '.')
+revoked_path=$(jsonnet -e "(import '$farm_auth').paths.revoked" | yq -p json '.')
+jwks_cm=$(jsonnet "$farm_jwks_config" | yq -p json '.configMapName')
+[ "${jwks_path%/*}" = "$(mount_of "$jwks_cm")" ] || problem "$farm_frontend: GitHub's keys $jwks_path are not in the mount of the ConfigMap $jwks_cm"
+[ "$(jsonnet "$farm_jwks_config" | yq -p json '.configMapKey')" = "${jwks_path##*/}" ] \
+  || problem "$farm_jwks_config: the key it writes is not ${jwks_path##*/}"
+[ "${revoked_path%/*}" = "$(mount_of farm-revoked)" ] || problem "$farm_frontend: the revoked clients $revoked_path are not in the mount of farm-revoked"
+[ "$(yq 'select(.kind == "Role") | .rules[0].resourceNames[0]' "$farm_jwks_admin")" = "$jwks_cm" ] || problem "$farm_jwks_admin: the Role is not for the ConfigMap $jwks_cm"
+[ "$(jsonnet "$farm_jwks_config" | yq -p json '.httpClient.proxyUrl')" = "http://$proxy:3128" ] \
+  || problem "$farm_jwks_config: the proxy is not http://$proxy:3128"
+jwks_image=$(yq 'select(.kind == "CronJob") | .spec.jobTemplate.spec.template.spec.containers[0].image' "$farm_jwks")
+[ "$(echo "${jwks_image#*:}" | cut -d@ -f1)" = "$(echo "${storage_image#*:}" | cut -d@ -f1)" ] \
+  || problem "$farm_jwks: the job's image $jwks_image is not bb-storage's version $storage_image"
+jwks_label=$(yq 'select(.kind == "CronJob") | .spec.jobTemplate.spec.template.metadata.labels["app.kubernetes.io/name"]' "$farm_jwks")
+[ "$(yq 'select(.kind == "NetworkPolicy") | .spec.podSelector.matchLabels["app.kubernetes.io/name"]' "$farm_jwks_admin")" = "$jwks_label" ] \
+  || problem "$farm_jwks_admin: the NetworkPolicy is not for the job's pods ($jwks_label)"
+[ "$(yq 'select(.kind == "NetworkPolicy") | .spec.egress[0].to[0].ipBlock.cidr' "$farm_jwks_admin")" = "$node_ip/32" ] \
+  || problem "$farm_jwks_admin: the API's address is not the node's $node_ip/32"
+[ "$(yq 'select(.kind == "CronJob") | .spec.jobTemplate.spec.template.spec.serviceAccountName' "$farm_jwks")" = \
+  "$(yq 'select(.kind == "RoleBinding") | .subjects[0].name' "$farm_jwks_admin")" ] \
+  || problem "$farm_jwks_admin: the RoleBinding is not for the job's ServiceAccount"
+echo "build farm credentials: GitHub's keys at $jwks_path from $jwks_cm, revoked clients at $revoked_path, job $jwks_image"
+
 # Helper images used by more than one script.
 alpine_pre=$(sed -n 's/^test_image=//p' scripts/preflight.sh)
 alpine_trial=$(sed -n 's/^pod_image=//p' scripts/trial.sh)
