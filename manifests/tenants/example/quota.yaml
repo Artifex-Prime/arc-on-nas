@@ -18,10 +18,10 @@ spec:
     limits.ephemeral-storage: 1Gi
     pods: "10"
     services: "5"
-    # One NodePort, for its service behind tenant-forward.yml. A NodePort answers on every address
-    # of the node and leads to its pods as their own address does, so their NetworkPolicies decide
-    # who gets through (networkpolicy.yaml). There is no load balancer.
-    services.nodeports: "1"
+    # A NodePort answers on every address of the node and leads to its pods as their own address
+    # does, so only a tenant with an ingress policy for it gets one (README, "Reaching a tenant's
+    # service"). There is no load balancer.
+    services.nodeports: "0"
     services.loadbalancers: "0"
     configmaps: "10"
     # Every object is a row in k3s's datastore, which the runners need too: a bound on each kind.

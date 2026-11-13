@@ -111,23 +111,6 @@ grep -qE "$(image_re swift "$swift-$runner(-ubuntu26.04-node$node)?")" helm/swif
 grep -qE "$(image_re ubuntu "$runner(-node$node)?")" helm/ubuntu.yaml || problem "helm/ubuntu.yaml: image tag is not $runner"
 grep -qE "$(image_re browser "$runner-node$node")" helm/browser.yaml || problem "helm/browser.yaml: image tag is not $runner-node$node"
 
-# The tenant forwarder (README, "Tenant namespaces", "Reaching a tenant's service"): it connects to
-# a NodePort on the node, from a fixed address of its own that a tenant's NetworkPolicy lets in
-# (the example's, manifests/tenants/example/networkpolicy.yaml), and listens on nothing there.
-tenant_forward=tenant-forward.yml
-example_policy=manifests/tenants/example/networkpolicy.yaml
-node_ip=$(sed -n '/^  k3s:/,/^  [a-z]/{s/^ *ipv4_address: *\([0-9.]*\).*/\1/p}' docker-compose.yml)
-# shellcheck disable=SC2016 # $$nodeport is the forwarder's own shell variable, literally
-grep -q '^ *TARGET=TCP4:'"$node_ip"':\$\$nodeport$' "$tenant_forward" \
-  || problem "$tenant_forward: the forwarder's target is not $node_ip:<the NodePort>"
-tenant_fwd=$(yq '.services.forward.networks.runners.ipv4_address' "$tenant_forward")
-grep -q "^ *runners=$tenant_fwd$" "$tenant_forward" || problem "$tenant_forward: the address it does not listen on is not its own $tenant_fwd"
-[ "${tenant_fwd%.*}.0/24" = "$subnet" ] || problem "$tenant_forward: the forwarder's address $tenant_fwd is not in $subnet"
-case "$tenant_fwd" in "$node_ip"|"$proxy"|"$forward"|"$gateway") problem "$tenant_forward: $tenant_fwd is taken" ;; esac
-[ "$(yq '.spec.ingress[].from[] | select(has("ipBlock")) | .ipBlock.cidr' "$example_policy")" = "$tenant_fwd/32" ] \
-  || problem "$example_policy: the ipBlock is not the forwarder's $tenant_fwd/32"
-echo "tenant forwarder: $tenant_fwd -> $node_ip:<NodePort>"
-
 # The example tenant's cache volume and claim name each other.
 example_pv=manifests/tenants/example/cache-volume.yaml
 example_pvc=manifests/tenants/example/cache-claim.yaml

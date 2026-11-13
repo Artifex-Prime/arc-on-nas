@@ -10,20 +10,18 @@ All notable changes to this repository. The format follows
 
 - The build farm left this repository for its owner's (AIDepartment, `deploy/build-farm/`): the
   `build-farm` tenant, its server, its cache volume and claim, `scripts/farm-tls.sh`, the runners'
-  `allow-build-farm` policy and the farm's smoke tests. What stays is the generic mechanism:
-  `manifests/tenants/base`, `admission.yaml`, and README "Tenant namespaces", which now says how a
-  tenant is added here or kept in another repository with this one's base by its commit.
-- `farm-forward.yml` is `tenant-forward.yml`: one port of any tenant's NodePort, forwarded to
-  another Docker network from the same fixed address, `172.31.250.12`, with the alias, the port
-  and the NodePort given as `TENANT_FORWARD_*` (project `ci-tenant`).
+  `allow-build-farm` policy and the farm's smoke tests. Its forwarder, `farm-forward.yml`, went to
+  the owner's host setup, whose networks and addresses it names. What stays is the generic
+  mechanism: `manifests/tenants/base`, `admission.yaml`, and README "Tenant namespaces", which now
+  says how a tenant is added here or kept in another repository with this one's base by its
+  commit, and how a host's forwarder reaches a tenant's service.
 
 ### Added
 
 - `manifests/tenants/example/`, a tenant to copy (not applied by `kubectl apply -k
-  manifests/tenants`): its namespace, quota, a cache volume reserved for its claim, and a policy
-  that admits the forwarder to its service. The smoke test applies it as the second tenant and
-  checks its service through `tenant-forward.yml`: reached from another Docker network, refused to
-  the other tenant, another namespace, the host and another address on the stack network.
+  manifests/tenants`): its namespace, quota and a cache volume reserved for its claim. The smoke
+  test applies it as the second tenant beside `zuul-trial`: the Role's permissions, the volume
+  bound to its claim only, and the NetworkPolicies between the two.
 
 - The build farm's network and TLS (README "The build farm's network"): the frontend speaks TLS
   only, with a key pair from a CA of the farm's own that it reads again every minute, so a renewal

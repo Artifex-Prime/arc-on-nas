@@ -12,11 +12,8 @@ name: CI
 #        permissions, admission's refusals and NET_RAW drops, the ephemeral-storage limits and an
 #        eviction for passing one, tenant-cert.sh's refusals and a
 #        certificate it signs used by kubectl with the kubeconfig it writes through
-#        api-forward.yml, the tenant NetworkPolicies against each target, with controls, a cache
-#        volume bound to its tenant's claim only, and a tenant's service (the example tenant's):
-#        reached through tenant-forward.yml from another Docker network, refused to the other
-#        tenant, another namespace, the host and another address on the stack network, at the pod,
-#        the Service, the NodePort and the forwarder's addresses.
+#        api-forward.yml, the tenant NetworkPolicies against each target, with controls, and a
+#        cache volume bound to its tenant's claim only.
 #
 # What a hosted runner cannot show (README, "Status"): a scale set registering with GitHub and
 # running a job (that needs a real credential and a repository to register with), the runner
@@ -634,84 +631,6 @@ jobs:
           k -n default delete pod open control --wait=false
           k -n default delete service open
           docker compose -p ci-api down
-
-      - name: A tenant's service through tenant-forward.yml
-        run: |
-          set -euo pipefail
-          k() { docker compose exec -T k3s kubectl "$@"; }
-          u=opifex-magnus
-          tk() { k --as "$u" --as-group devinfra -n example "$@"; }
-          # The example tenant's service, as a tenant serves one (README, "Reaching a tenant's
-          # service"): a pod with the label its NetworkPolicy names, behind a NodePort that keeps the
-          # connection's source address. Applied by the tenant.
-          tk run service --image="$BUSYBOX_IMAGE" --labels=app.kubernetes.io/name=service --port=8080 \
-            --command -- httpd -f -p 8080
-          tk apply -f - <<< '{"apiVersion": "v1", "kind": "Service", "metadata": {"name": "service-external"},
-            "spec": {"type": "NodePort", "externalTrafficPolicy": "Local",
-              "selector": {"app.kubernetes.io/name": "service"},
-              "ports": [{"port": 8080, "targetPort": 8080, "nodePort": 30080}]}}'
-          k -n zuul-trial run svc-client --image="$CURL_IMAGE" --command -- sleep 600
-          k -n default run svc-control --image="$CURL_IMAGE" --command -- sleep 600
-          for p in example/service zuul-trial/svc-client default/svc-control; do
-            k -n "${p%/*}" wait --for=condition=Ready "pod/${p#*/}" --timeout=180s
-          done
-          docker network create tenant-test
-          TENANT_FORWARD_NETWORK=tenant-test TENANT_FORWARD_ALIAS=example TENANT_FORWARD_PORT=8080 \
-            TENANT_FORWARD_NODEPORT=30080 docker compose -f tenant-forward.yml up -d --wait
-          fwd=$(docker ps -q --filter label=com.docker.compose.project=ci-tenant)
-          docker logs "$fwd"
-          # "answers" is any HTTP status; 000 is no connection, or one closed without an answer.
-          answers() { [[ "$1" =~ ^[1-5][0-9]{2}$ ]]; }
-          # far <url>: from a container on the forwarder's other network, as the tenant's clients are.
-          far() {
-            docker run --rm --network tenant-test "$CURL_IMAGE" -sS -o /dev/null -m 10 -w '%{http_code}' "$1" \
-              2> /dev/null || true
-          }
-          # Through the forwarder (after a minute of retries at most: the forwarder's first connection
-          # waits for the pod's address to reach the policies).
-          for _ in $(seq 1 20); do c=$(far http://example:8080/); answers "$c" && break; sleep 3; done
-          echo "tenant-test -> example:8080: $c (want an answer)"; answers "$c"
-          # Nothing else reaches the service: not the other tenant, not another namespace, at the pod,
-          # the Service or the NodePort on the node's address.
-          from() {
-            k -n "$1" exec "$2" -- curl -sS -o /dev/null -m 5 -w '%{http_code}' --noproxy '*' "$3" 2> /dev/null || true
-          }
-          pod_ip=$(k -n example get pod service -o jsonpath='{.status.podIP}')
-          for p in zuul-trial/svc-client default/svc-control; do
-            for a in "http://$pod_ip:8080/" http://service-external.example.svc:8080/ http://172.31.250.10:30080/; do
-              c=$(from "${p%/*}" "${p#*/}" "$a"); echo "$p -> $a: $c (want 000)"; [ "$c" = 000 ]
-            done
-          done
-          # Nor the host, at the NodePort; the control: the host reaches the node's address, so the
-          # 000 is the policy.
-          c=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' "http://172.31.250.10:30080/" || true)
-          echo "the host -> 172.31.250.10:30080: $c (want 000)"; [ "$c" = 000 ]
-          c=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' -k "https://172.31.250.10:6443/version" || true)
-          echo "the host -> 172.31.250.10:6443: $c (want 401)"; [ "$c" = 401 ]
-          # Nor another address on the stack network, at the NodePort or at the forwarder's address
-          # there, on which it does not listen.
-          for a in 172.31.250.10:30080 172.31.250.12:8080; do
-            c=$(docker run --rm --network ci_runners "$CURL_IMAGE" -sS -o /dev/null -m 10 -w '%{http_code}' \
-                  "http://$a/" 2> /dev/null || true)
-            echo "another address on the stack network -> $a: $c (want 000)"; [ "$c" = 000 ]
-          done
-          # The forwarder carries nobody else as itself: it listens only on its tenant-test address,
-          # and turns away that network's gateway, which is the host, and every other address of the
-          # host, which is outside that network's subnet: here the stack network's gateway.
-          fwd_ip=$(docker inspect --format '{{(index .NetworkSettings.Networks "tenant-test").IPAddress}}' "$fwd")
-          for a in 172.31.250.12 "$fwd_ip"; do
-            c=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' "http://$a:8080/" 2>&1 || true)
-            echo "the host -> the forwarder's $a:8080: $c"; [ "${c: -3}" = 000 ]
-          done
-          c=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' --interface "$GATEWAY" "http://$fwd_ip:8080/" 2>&1 || true)
-          echo "the host from $GATEWAY -> the forwarder's $fwd_ip:8080: $c"; [ "${c: -3}" = 000 ]
-          docker logs "$fwd" 2>&1 | tail -n 5
-          docker compose -p ci-tenant down
-          docker network rm tenant-test
-          k -n zuul-trial delete pod svc-client --wait=false
-          k -n default delete pod svc-control --wait=false
-          tk delete pod service --wait=false
-          tk delete service service-external
 
       - name: The proxy saw the pulls
         run: |

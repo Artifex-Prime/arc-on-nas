@@ -507,9 +507,9 @@ another repository, with its software, and use this one's base by its commit.
 | Kubernetes API | in their namespaces only ([`base/role.yaml`](manifests/tenants/base/role.yaml)): pods (with logs, `exec`, `attach`, `port-forward`), Deployments, StatefulSets, ReplicaSets, DaemonSets, Jobs, CronJobs, Services, ConfigMaps, Secrets, PersistentVolumeClaims, ServiceAccounts, HorizontalPodAutoscalers, PodDisruptionBudgets, Leases; read-only events, endpoints, NetworkPolicies, the quota and limits, pod metrics. Nothing cluster-scoped, no Roles or RoleBindings, no `escalate`, `bind` or `impersonate`. Like every authenticated user, they may also read the API's discovery documents and ask what they are allowed. |
 | Pods | Pod Security `baseline` enforced, `restricted` warned about and audited: no privileged containers, no host network, PID or IPC namespace, no `hostPath`, no host ports, no capabilities beyond the runtime's defaults. On top of that ([`admission.yaml`](manifests/tenants/admission.yaml), which says why): every container drops `NET_RAW` (added for pods that do not), only `restricted`'s volume types without `csi`, images only from registries on the internet (not localhost, an IP address or a cluster Service), and no Service with `externalIPs`. No PriorityClass, so a tenant's pod never preempts a runner. Unlike the runners, tenant pods may run as root and without a seccomp profile: images that need that (a sandbox that makes user namespaces, say) still run, at the price of more of the kernel within reach of a pod on a privileged node. |
 | Network | In: only from the namespace's own pods, so not from the runners or other tenants. Out: the internet through the proxy, and pods and Services in the cluster subject to their namespace's own policies; not the host, the node's own ports (the API server, also through its Service, and the kubelet) or anything else on the stack network; a NodePort leads to its pods as their own address does, so their namespace's ingress policy decides ([`base/networkpolicy.yaml`](manifests/tenants/base/networkpolicy.yaml)). A tenant cannot change these policies. The node's own image pulls are outside them, which is why images must come from the internet. |
-| Resources | A `ResourceQuota` and a `LimitRange` per namespace (`<tenant>/quota.yaml`): CPU, memory and ephemeral-storage requests and limits, claims and their storage, a count of every kind of object a tenant may create, no NodePorts (one for a tenant whose service the forwarder carries, as the example's) or load balancers, and a default memory and ephemeral-storage limit for every container that names none. |
+| Resources | A `ResourceQuota` and a `LimitRange` per namespace (`<tenant>/quota.yaml`): CPU, memory and ephemeral-storage requests and limits, claims and their storage, a count of every kind of object a tenant may create, no NodePorts (one for a tenant whose service a forwarder carries) or load balancers, and a default memory and ephemeral-storage limit for every container that names none. |
 | Reaching the API | Through the forwarder in [`api-forward.yml`](api-forward.yml): port 6443 of the node, and nothing else, on a Docker network of your choice. |
-| Reaching a tenant's service | Nothing outside the namespace, until the admin lets it in: the runner pods through the cluster's DNS, with an egress policy the tenant brings for them, and containers on a Docker network of your choice through the forwarder in [`tenant-forward.yml`](tenant-forward.yml) (below, "Reaching a tenant's service"). |
+| Reaching a tenant's service | Nothing outside the namespace, until the admin lets it in: the runner pods through the cluster's DNS, with an egress policy the tenant brings for them, and containers on another Docker network through a forwarder of the host's to the tenant's NodePort (below, "Reaching a tenant's service"). |
 
 **Sizing.** A tenant's requests compete with the runners for the node's allocatable; its limits
 compete for the k3s container's memory. The rule: the tenants' `requests.memory` plus the
@@ -664,9 +664,9 @@ and recreate the node, then the filesystem.
 
 **Adding a tenant.** Copy [`manifests/tenants/example/`](manifests/tenants/example) to a directory
 named after it: its namespace (with the label `arc-on-nas/tenant`, which the admission policies
-match), its quota and LimitRange (sized as above), its cache volume and claim if it needs one, its
-NetworkPolicy if anything outside the namespace reaches it (below), and [`base/`](manifests/tenants/base)
-last, for the shared policies, the Role and the RoleBinding. List it in
+match), its quota and LimitRange (sized as above), its cache volume and claim if it needs one, an
+ingress NetworkPolicy of its own if anything outside the namespace reaches it (below), and
+[`base/`](manifests/tenants/base) last, for the shared policies, the Role and the RoleBinding. List it in
 [`manifests/tenants/kustomization.yaml`](manifests/tenants/kustomization.yaml), and apply as above.
 
 A tenant kept in another repository, with its software, does the same there: its kustomization
@@ -688,50 +688,28 @@ before applying. This repository's owner keeps two that way, in AIDepartment: th
 checks) and Zuul (`deploy/zuul/`).
 
 **Reaching a tenant's service.** A tenant's pods are reached by nothing outside their namespace
-until the admin lets something in. Two routes, each one port of one pod, and each given by the admin:
+until the admin lets something in, with policies that come with the tenant and that the admin
+applies (a tenant can read its policies, not change them):
 
-| Client | Route |
-|---|---|
-| The runner pods (`arc-runners`) | The cluster's DNS and the tenant's Service. The runners' own egress policy allows DNS and the proxy only, so the tenant brings an egress policy for `arc-runners` to its pods' port, which the admin applies with it, and its own ingress policy lets in the namespace `arc-runners`. |
-| Containers on another Docker network | [`tenant-forward.yml`](tenant-forward.yml): socat with an alias on that network, to the tenant's NodePort on the node's address (`172.31.250.10`), from a fixed address of its own on the stack network, `172.31.250.12`, which the tenant's ingress policy lets in. Its NodePort Service keeps the connection's source address (`externalTrafficPolicy: Local`), so the policy sees who it is, and its quota allows that one NodePort. |
+- **The runner pods** (`arc-runners`) reach it through the cluster's DNS and the tenant's Service.
+  Their own egress policy allows DNS and the proxy only, so the tenant brings an egress policy for
+  `arc-runners` to its pods' port, and its own ingress policy lets in the namespace `arc-runners`.
+- **Containers on another Docker network** reach it through a forwarder of the host's own, on
+  that network and on the stack network, to the tenant's NodePort on the node's address
+  (`172.31.250.10`), as [`api-forward.yml`](api-forward.yml) does for the API server. The
+  forwarder takes a fixed address on the stack network that nothing else here uses, and the
+  tenant's ingress policy lets in that address and no other. Its NodePort Service keeps the
+  connection's source address (`externalTrafficPolicy: Local`), so the policy sees who it is, and
+  its quota allows that one NodePort. Since the policy trusts the forwarder's address, the
+  forwarder must carry nobody else from there: it listens only on its address on the other
+  network, and takes connections only from that network's subnet, less its gateway (the host).
+  A host port instead would listen on the host's addresses, so the LAN would reach the service.
 
 Nothing else gets through: the other tenants, other namespaces, the host and anything else on the
 stack network are turned away by the tenant's ingress policy, at the Service and at the NodePort
-alike ([`example/networkpolicy.yaml`](manifests/tenants/example/networkpolicy.yaml) admits the
-forwarder alone). Since that policy trusts the forwarder's address, the forwarder carries nobody
-else from there: it listens only on its address on the other network, which nothing on the stack
-network can reach, and takes connections only from that network's subnet, less its gateway.
-Docker lets the host reach every container's address, internal networks too, and a process on the
-host may connect from any of the host's addresses: the one in that subnet is the gateway, and the
-others are outside it. No host port is published, so the LAN and the internet reach none of this.
-Everything else on the forwarder's Docker network reaches that port, as with the API forwarder: a
-service that must tell its clients apart authenticates them itself. The smoke test checks the
-route and each refusal with the example tenant.
-
-**Why a forwarder, and not a host port.** A host port listens on the host's addresses, so the LAN
-would reach the service; Docker's internal networks don't, and the forwarder is on two of them. It
-holds no key, so TLS, if the service speaks it, ends at the tenant's pod, and it changes nothing in
-the cluster.
-
-**Starting the forwarder**, as the admin, once the tenant serves:
-
-```sh
-TENANT_FORWARD_NETWORK=<network> TENANT_FORWARD_ALIAS=<name> TENANT_FORWARD_PORT=<port> \
-  TENANT_FORWARD_NODEPORT=<nodePort> docker compose -f tenant-forward.yml up -d
-```
-
-Clients on `<network>` reach the service as `<name>:<port>`. The four values are the tenant's; a
-tenant may keep them in an env file of its own, for `docker compose --env-file`. The forwarder
-takes the gateway to be the network's first address, as Docker makes it. If
-`docker network inspect <network>` shows another, add `TENANT_FORWARD_GATEWAY=<that address>`. Its
-log's first line says what it listens on, the subnet it takes connections from, the gateway it
-refuses and the NodePort it connects to. There is one forwarder address, so one forwarder per
-stack.
-
-Check, from a container on `<network>`: `<name>:<port>` answers. From the host, the same to the
-forwarder's address on `<network>` gets no answer, also with curl's `--interface` set to another of
-the host's addresses, and to `172.31.250.12` no connection. Removing the forwarder:
-`docker compose -p ci-tenant down`.
+alike. The forwarder is the host's, not this repository's: it names the host's network, and its
+address on the stack network is the host's to choose (this repository's owner keeps theirs with
+the host's setup).
 
 ## Building the images
 
@@ -1085,7 +1063,6 @@ change recreates the node, every pod restarts and the running job fails. Drain f
 | `docker-compose.yml`, `.env.example`, `squid.conf` | The stack: the node, the proxy, the Helm client. |
 | `manifests/` | Namespaces with Pod Security labels, NetworkPolicies, the cache volume and claim; `manifests/tenants/`, the tenant namespaces, their base and admission policies, and an example tenant to copy. |
 | `api-forward.yml` | The optional forwarder to the API server for tenant users. |
-| `tenant-forward.yml` | The optional forwarder to one port of a tenant's NodePort for clients on another Docker network. |
 | `helm/` | Values for the controller and the `swift`, `ubuntu` and `browser` scale sets. |
 | `images/` | The runner images. |
 | `scripts/` | `preflight.sh`, `trial.sh`, `register.sh`, `tenant-cert.sh`, `warm.sh`, `prune-cache.sh`; `lint.sh` and `check-consistency.sh` for development. |
