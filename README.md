@@ -754,8 +754,10 @@ else on the stack network are turned away, at the Service and at the NodePort al
 keeps the connection's source address (`externalTrafficPolicy: Local`), so the policy sees who it
 is. Since the policy trusts the forwarder's address, the forwarder carries nobody else from
 there: it listens only on its address on the other network, which nothing on the stack network
-can reach, and it closes every connection from that network's gateway, which is the host. Docker
-lets the host reach every container's address, internal networks too. No host port is published,
+can reach, and takes connections only from that network's subnet, less its gateway. Docker lets
+the host reach every container's address, internal networks too, and a process on the host may
+connect from any of the host's addresses: the one in that subnet is the gateway, and the others
+are outside it. No host port is published,
 so the LAN and the internet reach none of this. The runners reach
 neither the storage pod nor the scheduler. Everything else on the forwarder's Docker network reaches the
 frontend's port, as with the API forwarder; per-client credentials, on top of TLS, are what will
@@ -802,12 +804,13 @@ FARM_FORWARD_NETWORK=<network> docker compose -f farm-forward.yml up -d
 
 The forwarder takes the gateway to be the network's first address, as Docker makes it. If
 `docker network inspect <network>` shows another, add `FARM_FORWARD_GATEWAY=<that address>`. Its
-log's first line says what it listens on and whom it refuses.
+log's first line says what it listens on, the subnet it takes connections from, and the gateway
+it refuses.
 
 Check, from a container on `<network>` with the CA's certificate:
 `grpcurl -cacert ca.crt build-farm:8980 grpc.health.v1.Health/Check` answers `SERVING`. From the
-host, the same to the forwarder's address on `<network>` gets no TLS session, and to `172.31.250.12`
-no connection.
+host, the same to the forwarder's address on `<network>` gets no TLS session, also with curl's
+`--interface` set to another of the host's addresses, and to `172.31.250.12` no connection.
 Removing the forwarder: `docker compose -p ci-farm down`.
 
 ## Building the images

@@ -842,6 +842,13 @@ jobs:
                   --connect-to "build-farm:8980:$a:8980" https://build-farm:8980/ 2>&1 || true)
             echo "the host -> the forwarder's $a:8980: $c"; [ "${c: -3}" = 000 ]
           done
+          # Nor from another of the host's addresses, outside the forwarder's subnet: here the stack
+          # network's gateway, which any process on the host may connect from.
+          c=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' --cacert "$RUNNER_TEMP/farm-ca-public/ca.crt" \
+                --interface "$GATEWAY" --connect-to "build-farm:8980:$fwd_ip:8980" \
+                https://build-farm:8980/ 2>&1 || true)
+          echo "the host from $GATEWAY -> the forwarder's $fwd_ip:8980: $c"; [ "${c: -3}" = 000 ]
+          docker logs "$(docker ps -q --filter label=com.docker.compose.project=ci-farm)" 2>&1 | tail -n 5
 
           # Renewal: a new key pair in the Secret, served from then on without a restart. The
           # kubelet updates the volume within about a minute or two, and bb-storage reads it again

@@ -17,9 +17,11 @@
 # frontend's NetworkPolicy lets in that address and no other on the stack network
 # (manifests/tenants/build-farm/networkpolicy.yaml). So the forwarder must not carry anyone else
 # from there: it listens only on its address on the clients' network, which nothing on the stack
-# network can reach, and turns away that network's gateway, which is the host (Docker lets the
-# host reach every container's address, internal networks too). The gateway is the subnet's first
-# address, as Docker's default; set FARM_FORWARD_GATEWAY if the clients' network has another
+# network can reach, and takes connections only from that network's subnet (socat's range), less
+# its gateway. Docker lets the host reach every container's address, internal networks too, and a
+# process on the host may connect from any of the host's addresses: its address in the subnet is
+# the gateway, and every other one is outside it. The gateway is the subnet's first address, as
+# Docker's default; set FARM_FORWARD_GATEWAY if the clients' network has another
 # (`docker network inspect <network>` shows it). If you change the stack subnet
 # (docker-compose.yml), change both addresses here and the policy's too.
 name: ci-farm
@@ -42,8 +44,9 @@ services:
         GATEWAY=$${FARM_FORWARD_GATEWAY:-$${net%.*}.$$(( $${net##*.} + 1 ))}
         TARGET=TCP4:172.31.250.10:30980
         export GATEWAY TARGET
-        echo "listening on $${client%/*}:8980, refusing $$GATEWAY, to $$TARGET"
-        exec socat -lp socat "TCP4-LISTEN:8980,bind=$${client%/*},fork,reuseaddr,max-children=64" \
+        subnet=$$net/$${client#*/}
+        echo "listening on $${client%/*}:8980, from $$subnet but $$GATEWAY, to $$TARGET"
+        exec socat -lp socat "TCP4-LISTEN:8980,bind=$${client%/*},range=$$subnet,fork,reuseaddr,max-children=64" \
           SYSTEM:'[ "$$SOCAT_PEERADDR" != "$$GATEWAY" ] && exec socat - "$$TARGET"'
     environment:
       FARM_FORWARD_GATEWAY: ${FARM_FORWARD_GATEWAY:-}
