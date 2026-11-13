@@ -6,8 +6,9 @@
 # is gone before it starts the new one, on every update and restart.
 #
 # On SIGTERM bb-storage writes its state files before it exits, so a pod restart keeps everything
-# stored. A crash, or a node stopped without stopping its pods, loses what was stored since the
-# last state write (every five minutes at most, cache.libsonnet), and only that.
+# stored. A crash, or a node stopped without stopping its pods, loses what was stored after the
+# last state file it wrote: normally the last five minutes or so, more when syncing was slow or
+# failing (cache.libsonnet).
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:

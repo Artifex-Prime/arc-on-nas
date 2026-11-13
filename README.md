@@ -684,8 +684,10 @@ into a ConfigMap whose name carries a hash of its contents, so a changed file re
 that use it. The storage pod is never two: its StatefulSet stops the old pod before it starts a
 new one. On SIGTERM bb-storage writes its state before it exits, so a pod restart or a drain keeps
 the cache. A crash, or a node stopped without a drain (`docker compose up -d` recreating it, a host
-reboot), kills the pod instead, and loses what was written in the last five minutes at most. The scheduler's queue
-does not survive a restart: the operations in it fail, and Bazel retries them. The smoke test
+reboot), kills the pod instead, and loses what was stored after the last state it wrote: normally
+the last five minutes or so, since it writes its state at most once every five minutes after
+writes, and more when syncing its files was slow or failing (bb-storage retries a failed sync with
+no deadline). The scheduler's queue does not survive a restart: the operations in it fail, and Bazel retries them. The smoke test
 applies the server as a tenant, writes a blob and an action result through the frontend from a
 pod in the namespace, reads them back, restarts the storage pod and reads them again.
 

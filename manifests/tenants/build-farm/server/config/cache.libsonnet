@@ -28,8 +28,11 @@
 // buildbarn_lossymap_hash_map_put_too_many_iterations_total above zero means a map is too small for
 // its store.
 //
-// Persistence: each store's state file is written every five minutes, so a restart keeps the
-// cache, and a crash loses at most the objects written since then.
+// Persistence: after writes, each store syncs its files and then writes its state file, at most
+// once per minimumEpochInterval (five minutes). That is a lower bound: a slow sync takes longer, and
+// a failing one is retried with no deadline. A restart keeps what the last state file written
+// describes; a crash loses what was stored after it, normally the last five minutes or so, more
+// when syncing was slow or failing.
 
 local KiB = 1024;
 local MiB = 1024 * KiB;
