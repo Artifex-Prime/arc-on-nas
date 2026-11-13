@@ -73,7 +73,8 @@ jobs:
       GATEWAY: 172.31.250.1
       CURL_IMAGE: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
       BUSYBOX_IMAGE: busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
-      GRPCURL_IMAGE: fullstorydev/grpcurl:v1.9.3@sha256:085e183ca334eb4e81ca81ee12cbb2b2737505d1d77f5e33dabc5d066593d998
+      # yamllint disable-line rule:line-length
+      GRPCURL_IMAGE: fullstorydev/grpcurl:v1.9.3-alpine@sha256:4614424ed58e9b9837c48b6b8eadb9ef40491d5af3499bcc8b378e9c64a9e4a9
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -540,38 +541,42 @@ jobs:
           k -n build-farm rollout status deployment/scheduler --timeout=180s
           k -n build-farm rollout status deployment/frontend --timeout=180s
           k -n build-farm get pods -o wide
-          # call <pod> <method> <request>: one gRPC call to the frontend from a pod in build-farm,
-          # found by the server's reflection service; prints the response.
-          call() {
-            local pod=call-$RANDOM$RANDOM phase=
-            jq -n --arg pod "$pod" --arg image "$GRPCURL_IMAGE" --arg method "$1" --arg data "$2" '
-              {apiVersion: "v1", kind: "Pod", metadata: {name: $pod}, spec: {restartPolicy: "Never",
-                automountServiceAccountToken: false,
-                containers: [{name: "c", image: $image,
-                  args: ["-plaintext", "-d", $data, "frontend:8980", $method]}]}}' \
-              | k --as "$u" --as-group devinfra -n build-farm apply -f - > /dev/null
-            for _ in $(seq 1 60); do
-              phase=$(k -n build-farm get pod "$pod" -o jsonpath='{.status.phase}')
-              case "$phase" in Succeeded|Failed) break ;; esac
-              sleep 2
-            done
-            k -n build-farm logs "$pod"
-            k -n build-farm delete pod "$pod" --wait=false > /dev/null
-            [ "$phase" = Succeeded ] || { echo "$1: $phase" >&2; return 1; }
+          # A client in build-farm, as the farm's clients in the cluster will be (restricted, uid 65532).
+          jq -n --arg image "$GRPCURL_IMAGE" '
+            {apiVersion: "v1", kind: "Pod", metadata: {name: "client"}, spec: {
+              automountServiceAccountToken: false,
+              securityContext: {runAsUser: 65532, runAsGroup: 65532, runAsNonRoot: true,
+                seccompProfile: {type: "RuntimeDefault"}},
+              containers: [{name: "c", image: $image, command: ["sleep", "900"],
+                securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}}}]}}' \
+            | k --as "$u" --as-group devinfra -n build-farm apply -f -
+          k -n build-farm wait --for=condition=Ready pod/client --timeout=180s
+          # call <method> <request>: one gRPC call to the frontend's Service from the client, the
+          # method found by the server's reflection service; prints the response.
+          call() { k -n build-farm exec client -- grpcurl -plaintext -max-time 20 -d "$2" frontend:8980 "$1"; }
+          # retry <command...>: until it succeeds, for up to a minute. A new pod's address reaches
+          # the network policies and a new Service's endpoints reach kube-proxy a little after
+          # the pod is ready; until then a connection is refused.
+          retry() {
+            for _ in $(seq 1 20); do "$@" && return 0; sleep 3; done
+            "$@"
           }
+          retry call grpc.health.v1.Health/Check '{}'
           re=build.bazel.remote.execution.v2
           data="arc-on-nas smoke test $(date -u +%FT%TZ)"
           b64=$(printf %s "$data" | base64 -w0)
           digest=$(jq -nc --arg h "$(printf %s "$data" | sha256sum | cut -d' ' -f1)" --argjson s "${#data}" \
             '{hash: $h, size_bytes: $s}')
-          # check <when>: the blob and the action result read back through the frontend.
+          # check <when>: the blob and the action result read back through the frontend. Each step
+          # returns on failure itself: under retry, set -e does not apply inside it.
           check() {
+            local got
             got=$(call "$re.ContentAddressableStorage/BatchReadBlobs" "{\"digests\":[$digest]}" \
-              | jq -r '.responses[0].data')
-            echo "$1, the blob read back: $(base64 -d <<< "$got")"; [ "$got" = "$b64" ]
+              | jq -r '.responses[0].data') || return 1
+            echo "$1, the blob read back: $(base64 -d <<< "$got")"; [ "$got" = "$b64" ] || return 1
             got=$(call "$re.ActionCache/GetActionResult" "{\"action_digest\":$digest}" \
-              | jq -c '[.exitCode, .stdoutRaw]')
-            echo "$1, the action result: $got"; [ "$got" = "[42,\"$b64\"]" ]
+              | jq -c '[.exitCode, .stdoutRaw]') || return 1
+            echo "$1, the action result: $got"; [ "$got" = "[42,\"$b64\"]" ] || return 1
           }
           call "$re.ContentAddressableStorage/BatchUpdateBlobs" \
             "{\"requests\":[{\"digest\":$digest,\"data\":\"$b64\"}]}"
@@ -587,8 +592,9 @@ jobs:
           k -n build-farm delete pod storage-0
           for _ in $(seq 1 30); do k -n build-farm get pod storage-0 > /dev/null 2>&1 && break; sleep 2; done
           k -n build-farm wait --for=condition=Ready pod/storage-0 --timeout=180s
-          check "after a restart"
+          retry check "after a restart"
           k -n build-farm logs storage-0
+          k -n build-farm delete pod client --wait=false
           k --as "$u" --as-group devinfra -n build-farm delete -k "$server" --wait=false
 
       - name: The proxy saw the pulls
