@@ -1,0 +1,100 @@
+# One port of a tenant's NodePort, and nothing else, for clients on another Docker network (README,
+# "Tenant namespaces", "Reaching a tenant's service"). Optional, and a Compose project of its own,
+# so starting or removing it never touches the node:
+#
+#   TENANT_FORWARD_NETWORK=<network> TENANT_FORWARD_ALIAS=<name> TENANT_FORWARD_PORT=<port> \
+#     TENANT_FORWARD_NODEPORT=<nodePort> docker compose -f tenant-forward.yml up -d
+#   docker compose -p ci-tenant down
+#
+# <network> is an existing Docker network the clients are on. Clients reach the service as
+# <name>:<port> on that network (a port from 1024), through socat: one TCP port, forwarded byte for byte, so TLS, if
+# the service speaks it, ends at the tenant's pod and the forwarder holds no key. <nodePort> is the
+# tenant's NodePort Service on the node (30000-32767), with `externalTrafficPolicy: Local`, so that
+# its pods' ingress policy sees the forwarder's address. Run it once the tenant serves: until then
+# the port behind it is closed. A tenant may keep the four values in an env file of its own
+# (`docker compose --env-file`).
+#
+# On the stack network the forwarder only ever connects to that NodePort on the node's address,
+# and it routes nothing between the two networks (ip_forward is off). Its own address there is
+# fixed, 172.31.250.12: the tenant's ingress policy lets in that address and no other on the stack
+# network. So the forwarder must not carry anyone else from there: it listens only on its address
+# on the clients' network, which nothing on the stack network can reach, and takes connections only
+# from that network's subnet (socat's range), less its gateway. Docker lets the host reach every
+# container's address, internal networks too, and a process on the host may connect from any of
+# the host's addresses: its address in the subnet is the gateway, and every other one is outside
+# it. The gateway is the subnet's first address, as Docker's default; set TENANT_FORWARD_GATEWAY if
+# the clients' network has another (`docker network inspect <network>` shows it). If you change the
+# stack subnet (docker-compose.yml), change both addresses here, and tell the tenants: their
+# policies name the forwarder's.
+#
+# One address, so one forwarder per stack: one tenant's port. A second would need an address of
+# its own here and in that tenant's policy.
+name: ci-tenant
+
+services:
+  forward:
+    # socat 1.8 on Alpine, pinned by digest; the same image as api-forward.yml.
+    image: alpine/socat:1.8.0.3@sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e
+    # busybox's sh, ip and ipcalc from the image. Each connection gets its own sh and socat: the sh
+    # checks the peer's address (SOCAT_PEERADDR, named after -lp) and the socat connects. socat
+    # would split a colon in SYSTEM's command, so the target is in the environment.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        port=$$TENANT_FORWARD_PORT nodeport=$$TENANT_FORWARD_NODEPORT
+        # Numbers in range ("[" fails on anything else); the port above 1023: the forwarder runs
+        # with no capabilities.
+        [ "$$port" -ge 1024 ] 2> /dev/null && [ "$$port" -le 65535 ] \
+          || { echo "TENANT_FORWARD_PORT is not in 1024-65535: $$port" >&2; exit 1; }
+        [ "$$nodeport" -ge 30000 ] 2> /dev/null && [ "$$nodeport" -le 32767 ] \
+          || { echo "TENANT_FORWARD_NODEPORT is not in 30000-32767: $$nodeport" >&2; exit 1; }
+        runners=172.31.250.12
+        client=$$(ip -4 -o addr show scope global | awk '{print $$4}' | grep -v "^$$runners/")
+        [ "$$(echo "$$client" | wc -l)" = 1 ] || { echo "not one address beside $$runners: $$client" >&2; exit 1; }
+        net=$$(ipcalc -n "$$client" | sed 's/^NETWORK=//')
+        GATEWAY=$${TENANT_FORWARD_GATEWAY:-$${net%.*}.$$(( $${net##*.} + 1 ))}
+        TARGET=TCP4:172.31.250.10:$$nodeport
+        export GATEWAY TARGET
+        subnet=$$net/$${client#*/}
+        echo "listening on $${client%/*}:$$port, from $$subnet but $$GATEWAY, to $$TARGET"
+        exec socat -lp socat "TCP4-LISTEN:$$port,bind=$${client%/*},range=$$subnet,fork,reuseaddr,max-children=64" \
+          SYSTEM:'[ "$$SOCAT_PEERADDR" != "$$GATEWAY" ] && exec socat - "$$TARGET"'
+    environment:
+      TENANT_FORWARD_PORT: ${TENANT_FORWARD_PORT:?set TENANT_FORWARD_PORT to the port the clients connect to}
+      TENANT_FORWARD_NODEPORT: ${TENANT_FORWARD_NODEPORT:?set TENANT_FORWARD_NODEPORT to the tenant's NodePort}
+      TENANT_FORWARD_GATEWAY: ${TENANT_FORWARD_GATEWAY:-}
+    restart: unless-stopped
+    labels:
+      - com.centurylinklabs.watchtower.enable=false
+    user: "65534:65534"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 0.5
+    mem_limit: 64m
+    pids_limit: 256
+    sysctls:
+      net.ipv4.ip_forward: 0
+    logging:
+      driver: local
+      options:
+        max-size: 1m
+        max-file: "2"
+    networks:
+      runners:
+        ipv4_address: 172.31.250.12
+      clients:
+        aliases:
+          - ${TENANT_FORWARD_ALIAS:?set TENANT_FORWARD_ALIAS to the name the clients use}
+
+networks:
+  # The stack network, created by docker-compose.yml (project "ci", network "runners").
+  runners:
+    external: true
+    name: ci_runners
+  clients:
+    external: true
+    name: ${TENANT_FORWARD_NETWORK:?set TENANT_FORWARD_NETWORK to the clients' Docker network}
