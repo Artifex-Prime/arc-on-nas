@@ -74,10 +74,11 @@ fi
 trap cleanup EXIT
 
 echo "== Starting $name ($image, snapshotter $snapshotter)"
+# The same entrypoint as docker-compose.yml: without its /dev/zfs, the kubelet can measure ZFS.
 "${docker[@]}" run -d --name "$name" --privileged --cgroupns=private \
   --tmpfs /run --tmpfs /var/run \
   -v "$name:/var/lib/rancher/k3s" \
-  "$image" server \
+  --entrypoint /bin/sh "$image" -c 'rm -f /dev/zfs && exec /bin/k3s "$@"' k3s server \
   --node-name=k3s-trial --disable=traefik,servicelb --disable-helm-controller \
   --snapshotter="$snapshotter" --kube-proxy-arg=conntrack-max-per-core=0 >/dev/null
 

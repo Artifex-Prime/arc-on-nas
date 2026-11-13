@@ -58,6 +58,10 @@ for f in images/swift/Dockerfile images/ubuntu/Dockerfile images/browser/Dockerf
 done
 
 grep -q "^image=$k3s_image$" scripts/trial.sh || problem "scripts/trial.sh: image differs from docker-compose.yml"
+# Both start k3s without the node's /dev/zfs (docker-compose.yml, the k3s service's entrypoint).
+for f in docker-compose.yml scripts/trial.sh; do
+  grep -q 'rm -f /dev/zfs && exec /bin/k3s' "$f" || problem "$f: k3s does not start without /dev/zfs"
+done
 
 # The chart version: helm/controller.yaml's install command is the source of truth.
 chart=$(sed -n 's/.*--version \([0-9][0-9.]*\) --namespace arc-systems.*/\1/p' helm/controller.yaml | head -n 1)
