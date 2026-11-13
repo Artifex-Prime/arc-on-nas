@@ -20,6 +20,13 @@ All notable changes to this repository. The format follows
   subject, attributes and the stored copy, for 90 days, and writes a kubeconfig without a key;
   `api-forward.yml` forwards the API server's port 6443, and nothing else, to another Docker
   network. The smoke test checks all of it.
+- The build farm's cache: a hostPath PersistentVolume `build-farm-cache`, reserved for the claim
+  `cache` in `build-farm`, and Buildbarn's storage settings for it (`build-farm/cache.libsonnet`):
+  fixed-size files of 131.2 GiB in all, below the volume's 150 GiB, with Buildbarn's recommended
+  block counts for eviction. README "Tenant namespaces" has the host's part (a filesystem with a
+  quota, the bind mount in `docker-compose.override.yml`). `scripts/lint.sh` evaluates the
+  settings and `scripts/check-consistency.sh` checks they fit the volume; the smoke test checks
+  the claim binds and another namespace's claim does not.
 - A browser runner image, `arc-runner-browser`, and its example scale set `helm/browser.yaml`: the
   Ubuntu image plus the shared libraries and fonts headless Chrome for Testing needs, so jobs can
   run page tests without installing packages. Image CI downloads a pinned Chrome for Testing build,

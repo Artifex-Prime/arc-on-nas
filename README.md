@@ -514,7 +514,7 @@ measure its filesystem, as on some ZFS hosts) neither are `emptyDir` sizes nor a
 writable layer. A tenant can fill the filesystems under the node's
 `/var/lib/kubelet` (every pod's `emptyDir`, the runners' workspaces among them) and
 `/var/lib/rancher/k3s` (images, local-path volumes). Give those their own filesystems with quotas
-if that matters.
+if that matters; `build-farm`'s cache has its own (below).
 
 **Applying it**, once, and after every change to `manifests/tenants/`:
 
@@ -581,6 +581,44 @@ outside the cluster: PersistentVolumes (a hostPath volume for a tenant's cache, 
 cluster roles a tenant's software asks for, the host's directories and their quotas, PriorityClasses,
 and this directory. Give a PersistentVolume made for a tenant a `claimRef` naming that
 namespace and claim: an unclaimed volume binds to any claim that fits, in any namespace.
+
+**A tenant's cache on the host.** `build-farm` ships one: a hostPath PersistentVolume,
+`build-farm-cache` ([`build-farm/cache-volume.yaml`](manifests/tenants/build-farm/cache-volume.yaml)),
+reserved by its `claimRef` for the claim `cache` in `build-farm`
+([`cache-claim.yaml`](manifests/tenants/build-farm/cache-claim.yaml)). It is for a remote build
+cache (Buildbarn's storage) that must outlive its pods and must not share the kubelet's
+filesystem. Its sizes and eviction settings are in [`build-farm/cache.libsonnet`](build-farm/cache.libsonnet),
+which the storage pod's configuration imports: fixed-size files of 131.2 GiB in all, recycled
+block by block, so the cache cannot outgrow them. Before applying it, the admin gives it a
+filesystem of its own with a quota above that total (150 GiB, the volume's capacity;
+`scripts/check-consistency.sh` checks the files fit), excluded from snapshots like `CACHE_DIR`,
+and with `exec`, `setuid` and `devices` off. The directory the volume names belongs to the
+storage pod's user:
+
+```sh
+sudo install -d -o 65532 -g 65532 -m 700 /path/to/build-farm-cache/storage
+```
+
+The k3s container sees it through a bind mount in `docker-compose.override.yml`, next to
+`docker-compose.yml`, which Compose reads by itself. It is not in `docker-compose.yml` because the
+cache is optional:
+
+```yaml
+services:
+  k3s:
+    volumes:
+      - type: bind
+        source: /path/to/build-farm-cache
+        target: /var/lib/build-farm-cache
+        bind:
+          create_host_path: false   # no cache filesystem, no node: never an empty directory instead
+```
+
+`docker compose up -d` then recreates the node, which fails any job running at that moment
+(drain first, [Operations](#operations)). Removing it: delete the claim, then the volume
+(`kubectl delete pv build-farm-cache`; `Retain` keeps the files until then), remove the mount
+and recreate the node, then the filesystem. Emptying the cache: stop the storage pod and delete the
+files under `storage/`; the next builds are cold.
 
 ## Building the images
 
@@ -929,6 +967,7 @@ change recreates the node, every pod restarts and the running job fails. Drain f
 |---|---|
 | `docker-compose.yml`, `.env.example`, `squid.conf` | The stack: the node, the proxy, the Helm client. |
 | `manifests/` | Namespaces with Pod Security labels, NetworkPolicies, the cache volume and claim; `manifests/tenants/`, the tenant namespaces. |
+| `build-farm/` | The build farm's cache settings for Buildbarn (`cache.libsonnet`). |
 | `api-forward.yml` | The optional forwarder to the API server for tenant users. |
 | `helm/` | Values for the controller and the `swift`, `ubuntu` and `browser` scale sets. |
 | `images/` | The runner images. |
