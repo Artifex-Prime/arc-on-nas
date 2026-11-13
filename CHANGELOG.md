@@ -32,7 +32,9 @@ All notable changes to this repository. The format follows
   (`manifests/tenants/build-farm/server/`, README "Tenant namespaces"): the storage pod on the
   claim `cache`, the scheduler, and the frontend that clients use, at the versions bb-deployments
   pins (bb-storage `20261102T091443Z-ca3d8b4`, bb-scheduler `20261102T094740Z-c9ba98c`), sized to
-  448Mi of requests and 1.75 GiB of limits, as uid 65532 and Pod Security `restricted`. The
+  448Mi of requests and 1.75 GiB of limits, as uid 65532 and Pod Security `restricted`. No
+  container asks for ephemeral storage, so the pods also schedule on a node without the kubelet's
+  local storage isolation. The
   configuration is jsonnet, generated into a ConfigMap; the cache settings moved next to it, from
   `build-farm/`. README has the upgrade and rollback procedure. `scripts/lint.sh` renders it with
   kustomize (added to `mise.toml`) and checks it with kubeconform, and

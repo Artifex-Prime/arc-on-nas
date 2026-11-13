@@ -55,9 +55,10 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: [ALL]}
+          # See kustomization.yaml for why no ephemeral-storage.
           resources:
-            requests: {cpu: 10m, memory: 16Mi, ephemeral-storage: 16Mi}
-            limits: {cpu: 100m, memory: 32Mi, ephemeral-storage: 16Mi}
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 32Mi}
           volumeMounts:
             - {name: cache, mountPath: /cache}
       containers:
@@ -80,9 +81,10 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: {drop: [ALL]}
           # Measured idle at about 30 MiB; the limit leaves room for the files' page cache.
+          # See kustomization.yaml for why no ephemeral-storage.
           resources:
-            requests: {cpu: 100m, memory: 256Mi, ephemeral-storage: 64Mi}
-            limits: {cpu: "2", memory: 1Gi, ephemeral-storage: 256Mi}
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "2", memory: 1Gi}
           volumeMounts:
             - {name: config, mountPath: /config, readOnly: true}
             - {name: cache, mountPath: /cache}
