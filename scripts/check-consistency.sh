@@ -108,10 +108,11 @@ grep -qE "$(image_re ubuntu "$runner(-node$node)?")" helm/ubuntu.yaml || problem
 grep -qE "$(image_re browser "$runner-node$node")" helm/browser.yaml || problem "helm/browser.yaml: image tag is not $runner-node$node"
 
 # The build farm's cache (README, "Tenant namespaces"): the volume and the claim name each other,
-# and Buildbarn's files (build-farm/cache.libsonnet) together stay below the volume's capacity,
-# which is the host directory's quota.
+# and Buildbarn's files (cache.libsonnet) together stay below the volume's capacity, which is the
+# host directory's quota.
 farm_pv=manifests/tenants/build-farm/cache-volume.yaml
 farm_pvc=manifests/tenants/build-farm/cache-claim.yaml
+farm_cache=manifests/tenants/build-farm/server/config/cache.libsonnet
 pv_name=$(yq '.metadata.name' "$farm_pv")
 pvc_name=$(yq '.metadata.name' "$farm_pvc")
 [ "$(yq '.spec.claimRef.namespace + "/" + .spec.claimRef.name' "$farm_pv")" = "build-farm/$pvc_name" ] \
@@ -125,11 +126,34 @@ case "$capacity" in
   *) problem "$farm_pv: capacity $capacity is not in Gi"; capacity_bytes=0 ;;
 esac
 # shellcheck disable=SC2016 # $x is yq's variable
-cache_bytes=$(jsonnet build-farm/cache.libsonnet \
+cache_bytes=$(jsonnet "$farm_cache" \
   | yq -p json '[.. | select(tag == "!!map" and has("sizeBytes")) | .sizeBytes] | .[] as $x ireduce (0; . + $x)')
 echo "build farm cache: $cache_bytes bytes of files, volume $capacity"
 [ "$cache_bytes" -gt 0 ] && [ "$cache_bytes" -lt "$capacity_bytes" ] \
-  || problem "build-farm/cache.libsonnet: the files' total $cache_bytes bytes is not below $capacity ($farm_pv)"
+  || problem "$farm_cache: the files' total $cache_bytes bytes is not below $capacity ($farm_pv)"
+
+# The build farm's server (README, "Tenant namespaces", "The build farm's server"): the storage pod
+# mounts that claim where cache.libsonnet puts its files, makes the directories it names, and runs
+# as the host directory's owner; the frontend runs the same bb-storage as the storage pod.
+farm_sts=manifests/tenants/build-farm/server/storage.yaml
+farm_frontend=manifests/tenants/build-farm/server/frontend.yaml
+sts='select(.kind == "StatefulSet") | .spec.template.spec'
+[ "$(yq "$sts | .volumes[] | select(.name == \"cache\") | .persistentVolumeClaim.claimName" "$farm_sts")" = "$pvc_name" ] \
+  || problem "$farm_sts: the volume cache is not the claim $pvc_name"
+mount_path=$(jsonnet -e "(import '$farm_cache').mountPath" | yq -p json '.')
+for c in initContainers containers; do
+  m=$(yq "$sts | .${c}[] | .volumeMounts[] | select(.name == \"cache\") | .mountPath" "$farm_sts" | sort -u)
+  [ "$m" = "$mount_path" ] || problem "$farm_sts: $c mount the cache at ${m:-nothing}, not $mount_path"
+done
+dirs=$(jsonnet -e "(import '$farm_cache').directories" | yq -p json '.[]' | sort)
+made=$(yq "$sts | .initContainers[] | select(.name == \"directories\") | .command[] | select(test(\"^/\"))" "$farm_sts" | sort)
+[ "$dirs" = "$made" ] || problem "$farm_sts: the init container makes other directories than $farm_cache names"
+[ "$(yq "$sts | .securityContext.runAsUser + \":\" + .securityContext.runAsGroup" "$farm_sts")" = 65532:65532 ] \
+  || problem "$farm_sts: the storage pod does not run as 65532:65532, the owner of the host directory"
+storage_image=$(yq "$sts | .containers[] | select(.name == \"storage\") | .image" "$farm_sts")
+frontend_image=$(yq 'select(.kind == "Deployment") | .spec.template.spec.containers[] | .image' "$farm_frontend")
+[ "$storage_image" = "$frontend_image" ] || problem "$farm_frontend: the frontend's image is not the storage pod's $storage_image"
+echo "build farm server: $storage_image, cache at $mount_path"
 
 # Helper images used by more than one script.
 alpine_pre=$(sed -n 's/^test_image=//p' scripts/preflight.sh)

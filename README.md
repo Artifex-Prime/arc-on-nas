@@ -618,7 +618,7 @@ namespace and claim: an unclaimed volume binds to any claim that fits, in any na
 reserved by its `claimRef` for the claim `cache` in `build-farm`
 ([`cache-claim.yaml`](manifests/tenants/build-farm/cache-claim.yaml)). It is for a remote build
 cache (Buildbarn's storage) that must outlive its pods and must not share the kubelet's
-filesystem. Its sizes and eviction settings are in [`build-farm/cache.libsonnet`](build-farm/cache.libsonnet),
+filesystem. Its sizes and eviction settings are in [`cache.libsonnet`](manifests/tenants/build-farm/server/config/cache.libsonnet),
 which the storage pod's configuration imports: fixed-size files of 131.2 GiB in all, recycled
 block by block, so the cache cannot outgrow them. Before applying it, the admin gives it a
 filesystem of its own with a quota above that total (150 GiB, the volume's capacity;
@@ -650,6 +650,74 @@ services:
 (`kubectl delete pv build-farm-cache`; `Retain` keeps the files until then), remove the mount
 and recreate the node, then the filesystem. Emptying the cache: stop the storage pod and delete the
 files under `storage/`; the next builds are cold.
+
+**The build farm's server.** `build-farm` ships one, for the tenant to apply:
+[Buildbarn](https://github.com/buildbarn)'s remote cache and the scheduler for remote execution,
+in [`build-farm/server/`](manifests/tenants/build-farm/server). Three workloads, one replica each:
+
+| Workload | What | Requests | Limits |
+|---|---|---|---|
+| `storage` (StatefulSet) | bb-storage on the claim `cache`: the CAS, the action cache and the file system access cache ([`config/cache.libsonnet`](manifests/tenants/build-farm/server/config/cache.libsonnet)) | 100m, 256Mi | 2 CPUs, 1Gi |
+| `scheduler` (Deployment) | bb-scheduler: the queue between the frontend and the workers, in memory | 50m, 64Mi | 1 CPU, 256Mi |
+| `frontend` (Deployment) | bb-storage as the clients' one address, `frontend.build-farm:8980`: cache requests to `storage`, execution to `scheduler` | 100m, 128Mi | 2 CPUs, 512Mi |
+
+Together they request 250m and 448Mi and are limited to 5 CPUs and 1.75 GiB, which leaves the rest
+of the quota (1.75 CPUs and 2.5 GiB requested, 6.25 GiB of memory limits) for the execution
+workers, which are not part of this. They each measured about 30 MiB idle; `GOMEMLIMIT` keeps Go's
+heap below each limit, and the storage pod's limit leaves room for the page cache of its files.
+Every container runs as uid 65532, the cache directory's owner, without capabilities or a
+writable root filesystem, and meets Pod Security `restricted`. Nothing authenticates a client yet:
+the namespace's NetworkPolicy admits only its own pods, so only pods in `build-farm` reach the
+servers.
+
+Applying it, as the tenant, once the admin has applied `manifests/tenants` and made the cache's
+filesystem (above):
+
+```sh
+kubectl -n build-farm apply -f manifests/tenants/build-farm/cache-claim.yaml
+kubectl -n build-farm apply -k manifests/tenants/build-farm/server
+kubectl -n build-farm rollout status statefulset/storage
+```
+
+The configuration is jsonnet in [`config/`](manifests/tenants/build-farm/server/config), generated
+into a ConfigMap whose name carries a hash of its contents, so a changed file replaces the pods
+that use it. The storage pod is never two: its StatefulSet stops the old pod before it starts a
+new one. On SIGTERM bb-storage writes its state before it exits, so a pod restart or a drain keeps
+the cache. A crash, or a node stopped without a drain (`docker compose up -d` recreating it, a host
+reboot), kills the pod instead, and loses what was stored after the last state it wrote: normally
+the last five minutes or so, since it writes its state at most once every five minutes after
+writes, and more when syncing its files was slow or failing (bb-storage retries a failed sync with
+no deadline). The scheduler's queue does not survive a restart: the operations in it fail, and Bazel retries them. The smoke test
+applies the server as a tenant, writes a blob and an action result through the frontend from a
+pod in the namespace, reads them back, restarts the storage pod and reads them again.
+
+**Upgrading the build farm's server.** Buildbarn publishes no releases, only an image per commit,
+and its configuration's schema changes between them. Follow
+[bb-deployments](https://github.com/buildbarn/bb-deployments), which pins a set that works
+together (bb-storage, bb-scheduler and the workers' images), and upgrade them all at once:
+
+1. Pick a bb-deployments commit. Diff its `kubernetes/config/` with the one pinned now (named in
+   [`build-farm/server/kustomization.yaml`](manifests/tenants/build-farm/server/kustomization.yaml)),
+   and carry each change into `config/`. Read its `changelog.md` for anything that changes the
+   storage format.
+2. Set the images in `storage.yaml`, `frontend.yaml` and `scheduler.yaml` to its tags, each with
+   its digest (`crane digest ghcr.io/buildbarn/bb-storage:<tag>`), and the commit in
+   `kustomization.yaml`. `scripts/lint.sh` evaluates the configuration, renders the manifests,
+   and checks the frontend and the storage pod run the same bb-storage.
+3. Review and merge, then apply as above from the merged commit and watch
+   `kubectl -n build-farm rollout status statefulset/storage` (then `deployment/scheduler` and
+   `deployment/frontend`). The storage pod is down while it restarts, typically seconds: builds
+   in flight retry, or build locally where they are set to fall back. After the rollout, a build with the remote
+   cache must still get hits; `kubectl -n build-farm logs storage-0` says
+   `Reinitializing data store` for each store whose state the new version could not read, which
+   empties that store (cold builds, no other harm).
+4. Rolling back: revert the commit, review, and apply again; or, at once,
+   `kubectl -n build-farm rollout undo statefulset/storage` (and the same for the two
+   Deployments), then the revert, so the repository matches what runs. A rollback across a
+   storage format change empties the cache in the same way.
+
+Removing it: `kubectl -n build-farm delete -k manifests/tenants/build-farm/server`. The claim and
+the cache stay; delete the claim too for the admin's removal of the volume (above).
 
 ## Building the images
 
@@ -999,8 +1067,7 @@ change recreates the node, every pod restarts and the running job fails. Drain f
 | Path | What |
 |---|---|
 | `docker-compose.yml`, `.env.example`, `squid.conf` | The stack: the node, the proxy, the Helm client. |
-| `manifests/` | Namespaces with Pod Security labels, NetworkPolicies, the cache volume and claim; `manifests/tenants/`, the tenant namespaces. |
-| `build-farm/` | The build farm's cache settings for Buildbarn (`cache.libsonnet`). |
+| `manifests/` | Namespaces with Pod Security labels, NetworkPolicies, the cache volume and claim; `manifests/tenants/`, the tenant namespaces, with the build farm's server (Buildbarn) in `manifests/tenants/build-farm/server/`. |
 | `api-forward.yml` | The optional forwarder to the API server for tenant users. |
 | `helm/` | Values for the controller and the `swift`, `ubuntu` and `browser` scale sets. |
 | `images/` | The runner images. |
