@@ -8,6 +8,17 @@ All notable changes to this repository. The format follows
 
 ### Added
 
+- The build farm's credentials (README "The build farm's credentials"): every request to the
+  frontend carries a JWT, GitHub's OIDC token for one repository's CI on self-hosted runners or a
+  token a client signs with an Ed25519 key of its own, whose public half is in
+  `config/clients.libsonnet`. Its claims give the request one instance name, `main` for `ci.yml`
+  in the merge queue or on `main` and `dev` for the rest, and the authorizer allows no other, nor
+  any client named in the ConfigMap `farm-revoked`. Every rule has test vectors that bb-storage
+  checks at startup. The CronJob `github-jwks` keeps GitHub's keys in a ConfigMap, through the
+  proxy, with the admin's Role for that one ConfigMap and a NetworkPolicy to the API server for
+  its pods (`manifests/tenants/build-farm/github-jwks.yaml`). The smoke test checks each kind of
+  token against each instance name, a revocation and a key rotation with the cache warm, and the
+  CronJob's fetch of GitHub's real keys.
 - The build farm's network and TLS (README "The build farm's network"): the frontend speaks TLS
   only, with a key pair from a CA of the farm's own that it reads again every minute, so a renewal
   needs no restart (`scripts/farm-tls.sh` makes the CA and signs the key pair into the Secret

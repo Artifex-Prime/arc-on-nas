@@ -682,17 +682,25 @@ heap below each limit, and the storage pod's limit leaves room for the page cach
 Every container runs as uid 65532, the cache directory's owner, without capabilities or a
 writable root filesystem, and meets Pod Security `restricted`. The frontend speaks TLS only, with
 the key pair in the Secret `frontend-tls`, and takes no action result or file system access
-profile from a client: only the workers write those, to the storage pod. Nothing authenticates a
-client yet. The runner pods and the forwarder reach the frontend, and only pods in `build-farm`
-reach the other two (below, "The build farm's network").
+profile from a client: only the workers write those, to the storage pod. It takes a credential
+from every client, and lets each use one instance name (below, "The build farm's credentials").
+The runner pods and the forwarder reach the frontend, and only pods in `build-farm` reach the
+other two (below, "The build farm's network"). A fourth workload, the CronJob `github-jwks`, keeps
+GitHub's signing keys for the frontend.
 
 Applying it, as the tenant, once the admin has applied `manifests/tenants` and made the cache's
-filesystem (above), and with the frontend's key pair (below, `scripts/farm-tls.sh`):
+filesystem (above), and with the frontend's key pair (below, `scripts/farm-tls.sh`) and its two
+ConfigMaps (below, "The build farm's credentials"):
 
 ```sh
 kubectl -n build-farm apply -f manifests/tenants/build-farm/cache-claim.yaml
 scripts/farm-tls.sh server --ca-cert ca.crt --ca-key <(secret-store get farm-ca-key) | kubectl -n build-farm apply -f -
+kubectl -n build-farm create configmap farm-revoked --from-literal=revoked=,
+jq -n --arg v "$(printf '{"keys":[]}' | base64 -w0)" \
+  '{apiVersion: "v1", kind: "ConfigMap", metadata: {name: "github-jwks"}, binaryData: {"jwks.json": $v}}' \
+  | kubectl -n build-farm create -f -
 kubectl -n build-farm apply -k manifests/tenants/build-farm/server
+kubectl -n build-farm create job --from=cronjob/github-jwks github-jwks-first
 kubectl -n build-farm rollout status statefulset/storage
 ```
 
@@ -807,11 +815,50 @@ The forwarder takes the gateway to be the network's first address, as Docker mak
 log's first line says what it listens on, the subnet it takes connections from, and the gateway
 it refuses.
 
-Check, from a container on `<network>` with the CA's certificate:
-`grpcurl -cacert ca.crt build-farm:8980 grpc.health.v1.Health/Check` answers `SERVING`. From the
+Check, from a container on `<network>` with the CA's certificate and a client's token:
+`grpcurl -cacert ca.crt -H "authorization: Bearer $token" build-farm:8980 grpc.health.v1.Health/Check`
+answers `SERVING` (without the token, `Unauthenticated`). From the
 host, the same to the forwarder's address on `<network>` gets no TLS session, also with curl's
 `--interface` set to another of the host's addresses, and to `172.31.250.12` no connection.
 Removing the forwarder: `docker compose -p ci-farm down`.
+
+**The build farm's credentials.** Every request to the frontend carries a JWT, and gets one
+instance name: `main` for trusted code, `dev` for the rest. The rules are in
+[`config/auth.libsonnet`](manifests/tenants/build-farm/server/config/auth.libsonnet), the clients
+in [`config/clients.libsonnet`](manifests/tenants/build-farm/server/config/clients.libsonnet):
+
+| Client | Token | Client name, instance name |
+|---|---|---|
+| CI | GitHub's OIDC token for the job, audience `aid-build-farm`: one repository, a self-hosted runner, an actor from the list | `ci-main`, `main`: `ci.yml` itself, in the merge queue (a `pull_request` run by `mergify[bot]` of `mergify/merge-queue/…`) or on `main` (by schedule or by hand, or called by `nightly.yml` there). `ci-dev`, `dev`: every other run |
+| Anyone else | signed by the client's own Ed25519 key, whose public half is in the list, with its name as `sub`, the audience, and an expiry | its name, `dev` |
+
+The authorizer lets a request use its instance name only, for the CAS, reading action results and
+executing, and refuses it while its client's name is in the ConfigMap `farm-revoked` (`,name,…,`).
+No client writes an action result. Each rule has test vectors, which bb-storage checks when it
+starts: a broken rule stops the frontend instead of opening it.
+
+GitHub's keys come from the CronJob `github-jwks` (bb-storage's `sync_jwks_to_configmap`), every 15
+minutes, through the proxy, into the ConfigMap `github-jwks`. It is the one tenant pod that reaches
+the API server: the admin's [`build-farm/github-jwks.yaml`](manifests/tenants/build-farm/github-jwks.yaml)
+gives its ServiceAccount `get` and `patch` on that ConfigMap alone, and its pods a way to the
+node's API port.
+
+- **Adding a client:** its line under `keys`, from the client's own key (the client's side, its
+  credential helper, is the consumer's). Applying the server restarts the frontend with it.
+- **Revoking one now:** `kubectl -n build-farm patch configmap farm-revoked -p
+  '{"data":{"revoked":",name,"}}'`, with the whole list. Its requests are refused within about two
+  minutes (the kubelet's update of the file, then the frontend's reading of it every minute), with
+  no restart.
+- **Removing one, or a key:** out of the list, and applied. The frontend checks a token once and
+  keeps the result until the token ends, so only its restart, which applying brings, forgets the
+  old key's tokens.
+- **Rotating a client's key:** both keys in its entry, the client switches, then the old one out.
+- Neither ConfigMap is in the kustomization: applying it again must not undo a revocation, or the
+  keys the job wrote.
+
+The smoke test (`.github/workflows/ci.yml`) checks each kind of token against each instance name,
+a revocation and a rotation with the frontend's cache warm, the CronJob's fetch of GitHub's real
+keys, and its access.
 
 ## Building the images
 
