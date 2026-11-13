@@ -2,6 +2,9 @@ name: CI
 
 # lint   every static check (scripts/lint.sh, with the tool versions in mise.toml).
 # host   scripts/preflight.sh and scripts/trial.sh on a GitHub-hosted runner.
+# zfs    the node with its kubelet and containerd directories on ZFS datasets, local storage
+#        isolation on: it starts, measures both at their quotas, and evicts a tenant's pod that
+#        writes past its ephemeral-storage limit.
 # smoke  the real stack on a GitHub-hosted runner: docker compose up, the node Ready, the
 #        manifests applied, the credential Secret created by scripts/register.sh, the controller
 #        chart installed through the proxy and running, the runner pod templates admitted by Pod
@@ -58,6 +61,112 @@ jobs:
         run: scripts/preflight.sh
       - name: scripts/trial.sh
         run: scripts/trial.sh --timeout 240
+
+  zfs:
+    name: The node on ZFS
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    # Above the waits below (about 12 minutes); a normal run takes about 3 minutes.
+    timeout-minutes: 20
+    env:
+      BUSYBOX_IMAGE: busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The node's kubelet and containerd directories on ZFS datasets with quotas and compression,
+      # bind-mounted as README "Requirements" suggests, and local storage isolation on.
+      - name: A ZFS pool, and the node's directories on it
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q zfsutils-linux > /dev/null
+          sudo modprobe zfs
+          sudo zfs version
+          truncate -s 8G "$RUNNER_TEMP/pool.img"
+          sudo zpool create -m none -O compression=lz4 -O atime=off ci "$RUNNER_TEMP/pool.img"
+          sudo zfs create -o quota=3G -o mountpoint=/mnt/ci-node/kubelet ci/kubelet
+          sudo zfs create -o quota=4G -o mountpoint=/mnt/ci-node/agent ci/agent
+          sudo zfs list -o name,quota,mountpoint
+          sudo install -d -o 1001 -g 1001 -m 750 "$RUNNER_TEMP/ci-cache/default"
+          sudo install -d -o 0 -g 0 -m 700 kubeconfig
+          cpus=$(nproc)
+          mem=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
+          cat > .env <<EOF
+          CACHE_DIR=$RUNNER_TEMP/ci-cache
+          K3S_CPUS=$cpus
+          K3S_MEMORY=4g
+          K3S_CPU_SHARES=256
+          K3S_PIDS_LIMIT=32768
+          K3S_SYSTEM_RESERVED=cpu=$(( cpus * 1000 - 1500 - 250 ))m,memory=$(( mem - 2560 - 512 ))Mi
+          K3S_KUBE_RESERVED=cpu=250m,memory=512Mi
+          K3S_SNAPSHOTTER=overlayfs
+          K3S_EXTRA_ARGS=
+          EOF
+          cat > docker-compose.override.yml <<EOF
+          services:
+            k3s:
+              volumes:
+                - /mnt/ci-node/agent:/var/lib/rancher/k3s/agent
+                - /mnt/ci-node/kubelet:/var/lib/kubelet
+          EOF
+          docker compose config --quiet
+
+      - name: The node is Ready and measures both datasets
+        run: |
+          set -euo pipefail
+          k() { docker compose exec -T k3s kubectl "$@"; }
+          docker compose up -d --wait --wait-timeout 180
+          for _ in $(seq 1 30); do k get node ci-node >/dev/null 2>&1 && break; sleep 2; done
+          k wait --for=condition=Ready node/ci-node --timeout=180s
+          if docker compose exec -T k3s test -e /dev/zfs; then echo "the node has /dev/zfs" >&2; exit 1; fi
+          fmt='{.status.capacity.ephemeral-storage} capacity, {.status.allocatable.ephemeral-storage} allocatable'
+          echo "node ephemeral-storage: $(k get node ci-node -o jsonpath="$fmt")"
+          # The kubelet's filesystem is the kubelet dataset, at its quota; the image filesystem the other.
+          got=$(k get --raw /api/v1/nodes/ci-node/proxy/stats/summary \
+            | jq -c '[.node.fs.capacityBytes, .node.runtime.imageFs.capacityBytes]')
+          echo "nodefs and imagefs capacity: $got"; [ "$got" = "[$((3 << 30)),$((4 << 30))]" ]
+
+      - name: A tenant pod writing past its limit on ZFS is evicted
+        run: |
+          set -euo pipefail
+          k() { docker compose exec -T k3s kubectl "$@"; }
+          k apply -k /opt/arc-on-nas/manifests/tenants > /dev/null
+          for _ in $(seq 1 60); do k -n zuul-trial get serviceaccount default >/dev/null 2>&1 && break; sleep 2; done
+          # Random data: the pool compresses, and blocks of zeros would take no room.
+          writer() {
+            jq -n --arg name "$1" --arg dir "$2" --arg mib "$3" --arg image "$BUSYBOX_IMAGE" '
+              {apiVersion: "v1", kind: "Pod", metadata: {name: $name}, spec: {restartPolicy: "Never",
+                volumes: [{name: "s", emptyDir: {}}],
+                containers: [{name: "w", image: $image, volumeMounts: [{name: "s", mountPath: "/scratch"}],
+                  command: ["sh", "-c", "dd if=/dev/urandom of=\($dir)/fill bs=1M count=\($mib) && sleep 600"],
+                  resources: {limits: {"ephemeral-storage": "64Mi"}}}]}}' \
+              | k --as opifex-magnus --as-group devinfra -n zuul-trial apply -f -
+          }
+          writer fill-volume /scratch 200
+          writer fill-layer /tmp 200
+          writer within /scratch 16
+          for p in fill-volume fill-layer; do
+            k -n zuul-trial wait --for=jsonpath='{.status.reason}'=Evicted "pod/$p" --timeout=240s
+            echo "$p: $(k -n zuul-trial get pod "$p" -o jsonpath='{.status.phase}: {.status.message}')"
+          done
+          phase=$(k -n zuul-trial get pod within -o jsonpath='{.status.phase}')
+          echo "within: $phase"; [ "$phase" = Running ]
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          docker compose logs --tail 100 k3s 2>&1 | grep -vE 'shared_informer|Caches are synced' | tail -n 60 || true
+          docker compose exec -T k3s kubectl get pods -A -o wide || true
+          docker compose exec -T k3s kubectl get events -A --sort-by=.lastTimestamp | tail -n 40 || true
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose down -v --timeout 30 || true
+          sudo zpool destroy -f ci || true
+          sudo rm -rf kubeconfig "$RUNNER_TEMP/ci-cache" .env docker-compose.override.yml
 
   smoke:
     name: Smoke test

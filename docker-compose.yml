@@ -21,6 +21,13 @@ services:
 
   k3s:
     image: rancher/k3s:v1.36.5-k3s1@sha256:057cfd5a9d51b89f1f0ee139c28d5d5fdd5aa7ddeac2742a0ba90c6dbc0329bb
+    # The node removes its own copy of /dev/zfs before k3s starts. The kubelet's cAdvisor reads a
+    # ZFS filesystem's size with the `zfs` command whenever /dev/zfs exists, and a privileged
+    # container always has it, but this image has no `zfs`: the kubelet then cannot measure
+    # /var/lib/kubelet on ZFS, and with local storage isolation on it never starts. Without
+    # /dev/zfs cAdvisor uses statfs, which reports a dataset's size within its quota. Nothing in
+    # the node needs /dev/zfs; on a host without ZFS there is none (README, "Requirements").
+    entrypoint: ["/bin/sh", "-c", "rm -f /dev/zfs && exec /bin/k3s \"$$@\"", "k3s"]
     # One server, no agents, so no K3S_TOKEN: k3s generates its own and only agents would use it.
     command: >-
       server

@@ -66,13 +66,17 @@ cgroup v2 on ext4):
   network but not from the pod (the NetworkPolicy; the plain container is the control). Without
   the proxy the pod reaches nothing on the internet, which the internal network alone explains.
 - the proxy's health check: it passes, and its command, run by hand on an access log padded past
-  10 MB, rotates the log.
+  10 MB, rotates the log;
+- the node on ZFS: with `/var/lib/kubelet` and `/var/lib/rancher/k3s/agent` bind-mounted from
+  ZFS datasets with quotas and compression on (OpenZFS 2.2 on the runner, a file-backed pool) and
+  local storage isolation on, the node is `Ready`, the kubelet measures both at their quotas, and
+  a tenant's pod that writes past its ephemeral-storage limit is evicted.
 
 **Not verified, because a hosted runner cannot show it.** Each is a documented step in the
 [Quick start](#quick-start) or [Operations](#operations), not an assumption:
 
-- **Any NAS.** Nothing here has run on a NAS or on ZFS. `preflight.sh` and `trial.sh` are the
-  test of your host; run them first.
+- **Any NAS.** Nothing here has run on a NAS, and ZFS only as above: with Docker's own data root
+  on ext4. `preflight.sh` and `trial.sh` are the test of your host; run them first.
 - **A scale set registering with GitHub and running a job.** That needs a real credential and a
   repository; the smoke test installs only the controller. The listener's restricted
   security context (from `listenerTemplate`) is schema-checked but has never run, which is why
@@ -254,12 +258,19 @@ Reporting a vulnerability: [SECURITY.md](SECURITY.md).
 - **ZFS:** overlayfs on ZFS needs OpenZFS 2.2 or later
   ([2.2.0 release notes](https://github.com/openzfs/zfs/releases/tag/zfs-2.2.0)). If your Docker
   data root is on ZFS and Docker's `overlay2` already works there, the nested containerd should
-  too, but the kubelet's disk accounting on pseudo-devices (ZFS, btrfs) has known failure modes
-  ([kind known issues](https://kind.sigs.k8s.io/docs/user/known-issues/)). `trial.sh` is the test;
-  the fallback is `K3S_SNAPSHOTTER=native`. Put `CACHE_DIR` on a dataset without snapshots. If
-  the node still does not come up, `--kubelet-arg=local-storage-capacity-isolation=false` in
-  `K3S_EXTRA_ARGS` is the way out, at a price: nothing then bounds a pod's disk, and the tenant
-  namespaces' pods cannot be scheduled ([Tenant namespaces](#tenant-namespaces), "Disk").
+  too; `trial.sh` is the test, and the fallback is `K3S_SNAPSHOTTER=native`. Put `CACHE_DIR` on a
+  dataset without snapshots.
+  The kubelet must be able to measure `/var/lib/kubelet` ([Tenant namespaces](#tenant-namespaces),
+  "Disk"). On ZFS its cAdvisor asks the `zfs` command for a dataset's size whenever `/dev/zfs`
+  exists, and the k3s image has no `zfs`; so the node removes its own copy of `/dev/zfs` before k3s
+  starts (`docker-compose.yml`, the `k3s` service's `entrypoint`), and cAdvisor uses `statfs`,
+  which gives a dataset's size within its quota. With that, the node runs with its kubelet and
+  containerd directories on ZFS datasets (CI's ZFS job). Give `/var/lib/kubelet` a dataset of its
+  own with a quota, bind-mounted in a `docker-compose.override.yml`, rather than a Docker volume:
+  that is the room every pod's `emptyDir` shares. If the kubelet still cannot measure it
+  ("failed to get rootfs info" in the node's log), `--kubelet-arg=local-storage-capacity-isolation=false`
+  in `K3S_EXTRA_ARGS` gets the node up, at a price: nothing then bounds a pod's disk, and the
+  tenant namespaces' pods cannot be scheduled.
 - **Resources:** about 1.6 GB of memory for the control plane (k3s's own measurement,
   [resource profiling](https://docs.k3s.io/reference/resource-profiling)), plus what the runner
   pods need. The example sizing (`.env.example`, [Sizing](#sizing)) is for a host with 16 CPUs and
@@ -533,13 +544,15 @@ filesystem instead, as `build-farm`'s cache does (below).
 
 **This needs the kubelet's local storage isolation**, which is on unless
 `--kubelet-arg=local-storage-capacity-isolation=false` is in `K3S_EXTRA_ARGS` (the way out when the
-kubelet cannot measure its filesystem, as on some ZFS hosts: [Requirements](#requirements)). With
+kubelet cannot measure its filesystem: [Requirements](#requirements), "ZFS"). With
 it off the kubelet reports no ephemeral storage and evicts on none, so every tenant pod, which
 requests some through the LimitRange, stays `Pending` with "Insufficient ephemeral-storage". Check
 with `docker compose exec k3s kubectl get node ci-node -o jsonpath='{.status.allocatable.ephemeral-storage}'`:
 empty means off. On such a host, put `/var/lib/kubelet` on a filesystem the kubelet can measure
-(a bind mount of its own, rather than a Docker volume) and turn isolation back on; or delete the
-`ephemeral-storage` lines from the quotas, and then nothing bounds a tenant's disk.
+and turn isolation back on (on ZFS, the `entrypoint` above is what makes a dataset measurable);
+or delete the `ephemeral-storage` lines from the quotas, and then nothing bounds a tenant's disk.
+`kubectl apply -k manifests` does not apply the tenants' quotas; only `kubectl apply -k
+manifests/tenants` does, so run it only once the check above shows a value.
 
 Not bounded by any of this: local-path claims (k3s's default StorageClass, under
 `/var/lib/rancher/k3s/storage`), whose requested size the quota counts but local-path does not
@@ -947,6 +960,7 @@ proxy's log (`docker compose exec -u proxy proxy tail -n 100 /var/log/squid/acce
 | Symptom | Likely cause and fix |
 |---|---|
 | `docker compose up`: "Pool overlaps with other one on this address space" | Another network uses `172.31.250.0/24`. Change the subnet and the fixed addresses in the files listed at the top of `docker-compose.yml`; `scripts/check-consistency.sh` checks the copies it knows about. |
+| The node stays `NotReady`; k3s logs "failed to get rootfs info: cannot find filesystem info for device" naming a ZFS dataset | The node still has `/dev/zfs`: its `entrypoint` from `docker-compose.yml` is missing (an override replaced it, or the compose file is older). See [Requirements](#requirements), "ZFS". |
 | The node stays `NotReady`; k3s logs "failed to get rootfs info" or overlayfs/snapshotter errors | The storage under Docker's volumes (often ZFS or btrfs). Try `K3S_SNAPSHOTTER=native` in `.env` and `docker compose up -d`; test first with `scripts/trial.sh --snapshotter native`. |
 | System pods stuck in `ContainerCreating` / `ErrImagePull` | Image pulls fail through the proxy. Check the proxy log for `TCP_DENIED`, the host's DNS, and that the proxy is running. |
 | k3s logs "too many open files" or inotify errors | Raise `fs.inotify.max_user_watches` and `max_user_instances` on the host ([Requirements](#requirements)). |
@@ -964,14 +978,15 @@ proxy's log (`docker compose exec -u proxy proxy tail -n 100 /var/log/squid/acce
 
 ## FAQ
 
-**Does it run on TrueNAS SCALE, Synology DSM, Unraid, or on ZFS?** Not known: nothing here has
-run on a NAS or on ZFS yet ([Status](#status)). What the stack needs is in
+**Does it run on TrueNAS SCALE, Synology DSM, Unraid, or on ZFS?** On a NAS, not known: nothing
+here has run on one in CI ([Status](#status)). On ZFS datasets for the node's directories, yes
+(CI's ZFS job). What the stack needs is in
 [Requirements](#requirements): rootful Docker that can run privileged containers, cgroup v2, and
 overlayfs on Docker's data root. `scripts/preflight.sh` checks those, and `scripts/trial.sh` starts
 a real node and removes it; together they are the test of a host. On ZFS, overlayfs needs
 OpenZFS 2.2 or later; if the node does not come up, retry the trial with
-`--snapshotter native`. Whether the kubelet's disk accounting works on ZFS is also unknown:
-`trial.sh` lists any `failed to get rootfs info` lines. Reports from real hosts are the most useful
+`--snapshotter native`. `trial.sh` lists any `failed to get rootfs info` lines, the sign that the
+kubelet cannot measure its filesystem. Reports from real hosts are the most useful
 contribution ([CONTRIBUTING.md](CONTRIBUTING.md)).
 
 **Can I keep `kernel.panic_on_oops=0` on my host?** No. The kubelet sets it to 1 and

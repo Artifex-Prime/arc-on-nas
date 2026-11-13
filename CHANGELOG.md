@@ -39,6 +39,14 @@ All notable changes to this repository. The format follows
   `scripts/check-consistency.sh` checks the storage pod's claim, mount, directories and user
   against the cache settings. The smoke test applies it as a tenant, writes and reads a blob and an
   action result through the frontend, and reads them again after a restart of the storage pod.
+- The node starts without its copy of `/dev/zfs` (`docker-compose.yml`'s and `scripts/trial.sh`'s
+  entrypoint), so the kubelet can measure ZFS datasets: its cAdvisor asked the `zfs` command for a
+  dataset's size whenever `/dev/zfs` existed, the k3s image has none, and with local storage
+  isolation on the kubelet never started ("failed to get rootfs info: cannot find filesystem info
+  for device"). Without it, cAdvisor uses `statfs`. A new CI job, "The node on ZFS", runs the node
+  with its kubelet and containerd directories on ZFS datasets, isolation on, and checks that both
+  are measured at their quotas and that a tenant's pod writing past its limit is evicted.
+  `scripts/check-consistency.sh` checks both entrypoints.
 - A disk bound for each tenant namespace: `requests.ephemeral-storage` and
   `limits.ephemeral-storage` in its ResourceQuota (`zuul-trial` 4Gi, `build-farm` 8Gi), and an
   ephemeral-storage default (512Mi, 64Mi requested) and maximum per container in its LimitRange,
