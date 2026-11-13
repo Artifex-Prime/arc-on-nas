@@ -1,7 +1,7 @@
 # Buildbarn's scheduler (config/scheduler.jsonnet): the queue of actions between the frontend and
-# the execution workers (not part of this directory). One replica, replaced by stopping the old one first: two schedulers would
-# split the workers and the clients between them. Its queue is in memory, so a restart fails the
-# operations in it, and their clients retry.
+# the execution workers (not part of this directory). One replica, replaced by stopping the old
+# one first: two schedulers would split the workers and the clients between them. Its queue is in
+# memory, so a restart fails the operations in it, and their clients retry.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
