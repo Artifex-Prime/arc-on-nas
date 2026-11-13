@@ -17,8 +17,8 @@ name: CI
 #        cache write and read through its frontend over TLS (no plain text, no client's action
 #        result), a restart of its storage pod that keeps them, and its network: the frontend
 #        reached from a runner pod and through farm-forward.yml, refused to the other tenant,
-#        another namespace, the host and another address on the stack network, and a renewed
-#        certificate served without a restart.
+#        another namespace, the host and another address on the stack network, at the NodePort
+#        and at the forwarder's addresses, and a renewed certificate served without a restart.
 #
 # What a hosted runner cannot show (README, "Status"): a scale set registering with GitHub and
 # running a job (that needs a real credential and a repository to register with), the runner
@@ -828,18 +828,30 @@ jobs:
             echo "the forwarder's port answered without TLS" >&2; exit 1
           fi
           echo "farm-test -> build-farm:8980 without TLS: refused"
+          # The forwarder carries nobody else as itself: it listens only on its farm-test address,
+          # and turns away that network's gateway, which is the host.
+          docker logs "$(docker ps -q --filter label=com.docker.compose.project=ci-farm)"
+          c=$(docker run --rm --network ci_runners "$GRPCURL_IMAGE" -insecure -max-time 10 172.31.250.12:8980 \
+                grpc.health.v1.Health/Check 2>&1 || true)
+          echo "another address on the stack network -> the forwarder's 172.31.250.12:8980: $c"
+          grep -q 'Failed to dial target host' <<< "$c"
+          fwd_ip=$(docker inspect --format '{{(index .NetworkSettings.Networks "farm-test").IPAddress}}' \
+            "$(docker ps -q --filter label=com.docker.compose.project=ci-farm)")
+          for a in 172.31.250.12 "$fwd_ip"; do
+            c=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' --cacert "$RUNNER_TEMP/farm-ca-public/ca.crt" \
+                  --connect-to "build-farm:8980:$a:8980" https://build-farm:8980/ 2>&1 || true)
+            echo "the host -> the forwarder's $a:8980: $c"; [ "${c: -3}" = 000 ]
+          done
 
           # Renewal: a new key pair in the Secret, served from then on without a restart. The
           # kubelet updates the volume within about a minute or two, and bb-storage reads it again
           # every minute.
+          # served: the serial of the certificate the forwarder's clients get, in lower case without
+          # leading zeros (curl's %{certs} lists the server's certificate first).
           served() {
-            local ip
-            ip=$(docker inspect --format '{{(index .NetworkSettings.Networks "farm-test").IPAddress}}' \
-              "$(docker ps -q --filter label=com.docker.compose.project=ci-farm)")
-            # gRPC's server takes only connections that offer HTTP/2 (ALPN h2).
-            openssl s_client -connect "$ip:8980" -servername build-farm -alpn h2 \
-              -CAfile "$RUNNER_TEMP/farm-ca/ca.crt" -verify_return_error < /dev/null 2> /dev/null \
-              | openssl x509 -noout -serial
+            docker run --rm --network farm-test -v "$RUNNER_TEMP/farm-ca-public:/t:ro" "$CURL_IMAGE" \
+              -sS -o /dev/null -m 10 -w '%{certs}' --cacert /t/ca.crt https://build-farm:8980/ 2> /dev/null \
+              | sed -n 's/^Serial Number: *//p' | head -n 1 | tr -d ':' | tr 'A-F' 'a-f' | sed 's/^0*//'
           }
           before=$(served); echo "served before the renewal: $before"
           restarts() {
@@ -849,10 +861,12 @@ jobs:
           restarts=$(restarts)
           scripts/farm-tls.sh server --ca-cert "$RUNNER_TEMP/farm-ca/ca.crt" --ca-key "$RUNNER_TEMP/farm-ca/ca.key" \
             2> "$RUNNER_TEMP/renewed.txt" | k --as "$u" --as-group devinfra -n build-farm apply -f -
-          want=$(sed -n 's/^serial=//p' "$RUNNER_TEMP/renewed.txt"); echo "renewed: serial=$want"
+          want=$(sed -n 's/^serial=//p' "$RUNNER_TEMP/renewed.txt" | tr 'A-F' 'a-f' | sed 's/^0*//')
+          echo "renewed: serial $want"
+          [ -n "$before" ] && [ "$before" != "$want" ]
           now=""
-          for _ in $(seq 1 60); do now=$(served); [ "$now" = "serial=$want" ] && break; sleep 5; done
-          echo "served after the renewal: $now"; [ "$now" = "serial=$want" ]
+          for _ in $(seq 1 60); do now=$(served); [ "$now" = "$want" ] && break; sleep 5; done
+          echo "served after the renewal: $now"; [ "$now" = "$want" ]
           after=$(restarts)
           echo "frontend restarts: $restarts before, $after after"; [ "$restarts" = "$after" ]
           far build-farm:8980 grpc.health.v1.Health/Check | grep -q SERVING

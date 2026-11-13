@@ -752,8 +752,12 @@ runner pods, by their namespace, and the forwarder, by its fixed address on the 
 `172.31.250.12`, to port 8980 only. The other tenants, other namespaces, the host and anything
 else on the stack network are turned away, at the Service and at the NodePort alike: the NodePort
 keeps the connection's source address (`externalTrafficPolicy: Local`), so the policy sees who it
-is. No host port is published, so the LAN and the internet reach none of this. The runners reach
-neither the storage pod nor the scheduler. Everything on the forwarder's Docker network reaches the
+is. Since the policy trusts the forwarder's address, the forwarder carries nobody else from
+there: it listens only on its address on the other network, which nothing on the stack network
+can reach, and it closes every connection from that network's gateway, which is the host. Docker
+lets the host reach every container's address, internal networks too. No host port is published,
+so the LAN and the internet reach none of this. The runners reach
+neither the storage pod nor the scheduler. Everything else on the forwarder's Docker network reaches the
 frontend's port, as with the API forwarder; per-client credentials, on top of TLS, are what will
 tell those clients apart. The smoke test checks each route and each refusal.
 
@@ -796,8 +800,14 @@ docker compose exec k3s kubectl apply -k /opt/arc-on-nas/manifests/tenants
 FARM_FORWARD_NETWORK=<network> docker compose -f farm-forward.yml up -d
 ```
 
+The forwarder takes the gateway to be the network's first address, as Docker makes it. If
+`docker network inspect <network>` shows another, add `FARM_FORWARD_GATEWAY=<that address>`. Its
+log's first line says what it listens on and whom it refuses.
+
 Check, from a container on `<network>` with the CA's certificate:
-`grpcurl -cacert ca.crt build-farm:8980 grpc.health.v1.Health/Check` answers `SERVING`.
+`grpcurl -cacert ca.crt build-farm:8980 grpc.health.v1.Health/Check` answers `SERVING`. From the
+host, the same to the forwarder's address on `<network>` gets no TLS session, and to `172.31.250.12`
+no connection.
 Removing the forwarder: `docker compose -p ci-farm down`.
 
 ## Building the images

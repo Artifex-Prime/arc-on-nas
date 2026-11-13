@@ -168,10 +168,11 @@ farm_policy=manifests/tenants/build-farm/networkpolicy.yaml
 farm_config=manifests/tenants/build-farm/server/config/frontend.jsonnet
 node_ip=$(sed -n '/^  k3s:/,/^  [a-z]/{s/^ *ipv4_address: *\([0-9.]*\).*/\1/p}' docker-compose.yml)
 node_port=$(yq 'select(.metadata.name == "frontend-external") | .spec.ports[] | select(.name == "grpc") | .nodePort' "$farm_frontend")
-grep -q -- "- TCP4:$node_ip:$node_port$" "$farm_forward" || problem "$farm_forward: the forwarder's target is not $node_ip:$node_port"
+grep -q "^ *TARGET=TCP4:$node_ip:$node_port$" "$farm_forward" || problem "$farm_forward: the forwarder's target is not $node_ip:$node_port"
 [ "$(yq 'select(.metadata.name == "frontend-external") | .spec.externalTrafficPolicy' "$farm_frontend")" = Local ] \
   || problem "$farm_frontend: frontend-external does not keep the source address (externalTrafficPolicy Local)"
 farm_fwd=$(yq '.services.forward.networks.runners.ipv4_address' "$farm_forward")
+grep -q "^ *runners=$farm_fwd$" "$farm_forward" || problem "$farm_forward: the address it does not listen on is not its own $farm_fwd"
 [ "${farm_fwd%.*}.0/24" = "$subnet" ] || problem "$farm_forward: the forwarder's address $farm_fwd is not in $subnet"
 case "$farm_fwd" in "$node_ip"|"$proxy"|"$forward"|"$gateway") problem "$farm_forward: $farm_fwd is taken" ;; esac
 [ "$(yq '.spec.ingress[].from[] | select(has("ipBlock")) | .ipBlock.cidr' "$farm_policy")" = "$farm_fwd/32" ] \
