@@ -1,5 +1,5 @@
-# The build farm's cache: Buildbarn's storage (build-farm/cache.libsonnet), on a host directory of
-# its own (README, "Tenant namespaces", "A tenant's cache on the host"). Cluster-scoped, so the
+# The build farm's cache: Buildbarn's storage (server/config/cache.libsonnet), on a host directory
+# of its own (README, "Tenant namespaces", "A tenant's cache on the host"). Cluster-scoped, so the
 # admin applies it, with the rest of this directory; the claim it is reserved for is
 # cache-claim.yaml.
 #

@@ -1,7 +1,7 @@
 // The build farm's cache: the storage backends of Buildbarn's storage pod (bb-storage), with their
 // sizes and eviction settings, on the claim `cache` in build-farm
 // (manifests/tenants/build-farm/cache-claim.yaml) mounted at `mountPath`. The storage pod's
-// configuration imports this file and places the fields as bb-deployments' storage.jsonnet does:
+// configuration, storage.jsonnet, imports this file and places the fields as bb-deployments' does:
 //
 //   contentAddressableStorageServer: { contentAddressableStorage: cache.contentAddressableStorage, ... },
 //   actionCache: { backend: cache.actionCache, ... },
@@ -9,8 +9,8 @@
 //
 // Written for bb-storage 20261102T091443Z-ca3d8b4, the version bb-deployments pinned on 2026-11-06
 // (its CAS splits large objects into chunks, so it has a chunk store and a chunk-mapping store).
-// The configuration's schema changes between versions: check it against the release notes when
-// the server is upgraded.
+// The configuration's schema changes between versions: check it on every upgrade (README, "Tenant
+// namespaces", "Upgrading the build farm's server").
 //
 // The size cap. Each store is LocalBlobAccess: fixed-size files, written block by block, so the
 // cache never grows past the files' sizes, whatever is written. Their total (131.2 GiB) stays below

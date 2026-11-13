@@ -9,7 +9,9 @@ name: CI
 #        permissions, admission's refusals and NET_RAW drops, the ephemeral-storage limits and an
 #        eviction for passing one, tenant-cert.sh's refusals and a
 #        certificate it signs used by kubectl with the kubeconfig it writes through
-#        api-forward.yml, and the tenant NetworkPolicies against each target, with controls.
+#        api-forward.yml, the tenant NetworkPolicies against each target, with controls, and the
+#        build farm's server: applied by the tenant, a cache write and read through its frontend,
+#        and a restart of its storage pod that keeps them.
 #
 # What a hosted runner cannot show (README, "Status"): a scale set registering with GitHub and
 # running a job (that needs a real credential and a repository to register with), the runner
@@ -71,6 +73,7 @@ jobs:
       GATEWAY: 172.31.250.1
       CURL_IMAGE: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
       BUSYBOX_IMAGE: busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+      GRPCURL_IMAGE: fullstorydev/grpcurl:v1.9.3@sha256:085e183ca334eb4e81ca81ee12cbb2b2737505d1d77f5e33dabc5d066593d998
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -519,6 +522,74 @@ jobs:
           k -n default delete pod open control --wait=false
           k -n default delete service open
           docker compose -p ci-api down
+
+      - name: The build farm's server
+        run: |
+          set -euo pipefail
+          k() { docker compose exec -T k3s kubectl "$@"; }
+          u=opifex-magnus
+          # The directory the cache volume names, owned by the storage pod's user. On a host it is a
+          # filesystem of its own, bind-mounted into the node (README, "Tenant namespaces"); here
+          # it is a directory in the node's container.
+          docker compose exec -T k3s sh -c 'd=/var/lib/build-farm-cache/storage
+            mkdir -p "$d" && chown 65532:65532 "$d" && chmod 700 "$d"'
+          # Applied by the tenant, as on a host.
+          server=/opt/arc-on-nas/manifests/tenants/build-farm/server
+          k --as "$u" --as-group devinfra -n build-farm apply -k "$server"
+          k -n build-farm rollout status statefulset/storage --timeout=300s
+          k -n build-farm rollout status deployment/scheduler --timeout=180s
+          k -n build-farm rollout status deployment/frontend --timeout=180s
+          k -n build-farm get pods -o wide
+          # call <pod> <method> <request>: one gRPC call to the frontend from a pod in build-farm,
+          # found by the server's reflection service; prints the response.
+          call() {
+            local pod=call-$RANDOM$RANDOM phase=
+            jq -n --arg pod "$pod" --arg image "$GRPCURL_IMAGE" --arg method "$1" --arg data "$2" '
+              {apiVersion: "v1", kind: "Pod", metadata: {name: $pod}, spec: {restartPolicy: "Never",
+                automountServiceAccountToken: false,
+                containers: [{name: "c", image: $image,
+                  args: ["-plaintext", "-d", $data, "frontend:8980", $method]}]}}' \
+              | k --as "$u" --as-group devinfra -n build-farm apply -f - > /dev/null
+            for _ in $(seq 1 60); do
+              phase=$(k -n build-farm get pod "$pod" -o jsonpath='{.status.phase}')
+              case "$phase" in Succeeded|Failed) break ;; esac
+              sleep 2
+            done
+            k -n build-farm logs "$pod"
+            k -n build-farm delete pod "$pod" --wait=false > /dev/null
+            [ "$phase" = Succeeded ] || { echo "$1: $phase" >&2; return 1; }
+          }
+          re=build.bazel.remote.execution.v2
+          data="arc-on-nas smoke test $(date -u +%FT%TZ)"
+          b64=$(printf %s "$data" | base64 -w0)
+          digest=$(jq -nc --arg h "$(printf %s "$data" | sha256sum | cut -d' ' -f1)" --argjson s "${#data}" \
+            '{hash: $h, size_bytes: $s}')
+          # check <when>: the blob and the action result read back through the frontend.
+          check() {
+            got=$(call "$re.ContentAddressableStorage/BatchReadBlobs" "{\"digests\":[$digest]}" \
+              | jq -r '.responses[0].data')
+            echo "$1, the blob read back: $(base64 -d <<< "$got")"; [ "$got" = "$b64" ]
+            got=$(call "$re.ActionCache/GetActionResult" "{\"action_digest\":$digest}" \
+              | jq -c '[.exitCode, .stdoutRaw]')
+            echo "$1, the action result: $got"; [ "$got" = "[42,\"$b64\"]" ]
+          }
+          call "$re.ContentAddressableStorage/BatchUpdateBlobs" \
+            "{\"requests\":[{\"digest\":$digest,\"data\":\"$b64\"}]}"
+          call "$re.ActionCache/UpdateActionResult" \
+            "{\"action_digest\":$digest,\"action_result\":{\"exit_code\":42,\"stdout_raw\":\"$b64\"}}"
+          check written
+          # The cache's files are on the volume, at their configured size, and sparse.
+          docker compose exec -T k3s sh -c 'cd /var/lib/build-farm-cache/storage
+            ls -ln cas ac; du -sh .'
+          size=$(docker compose exec -T k3s stat -c %s /var/lib/build-farm-cache/storage/cas/blocks)
+          echo "cas/blocks: $size bytes"; [ "$size" = 137438953472 ]
+          # The storage pod restarts (stopped, as on an update or a drain) and keeps both.
+          k -n build-farm delete pod storage-0
+          for _ in $(seq 1 30); do k -n build-farm get pod storage-0 > /dev/null 2>&1 && break; sleep 2; done
+          k -n build-farm wait --for=condition=Ready pod/storage-0 --timeout=180s
+          check "after a restart"
+          k -n build-farm logs storage-0
+          k --as "$u" --as-group devinfra -n build-farm delete -k "$server" --wait=false
 
       - name: The proxy saw the pulls
         run: |

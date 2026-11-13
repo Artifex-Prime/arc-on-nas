@@ -9,7 +9,8 @@
 #   helm lint        the ARC charts with helm/*.yaml
 #   helm template    the same, rendered; the runner and listener pod templates are extracted
 #   kubeconform      manifests/, the rendered charts and the extracted pod templates
-#   jsonnet          build-farm/*.libsonnet evaluate
+#   kustomize        the build farm's server rendered, then kubeconform on it
+#   jsonnet          the build farm's server configuration evaluates
 #   consistency      scripts/check-consistency.sh
 set -euo pipefail
 
@@ -76,8 +77,13 @@ kubeconform -strict -summary -skip AutoscalingRunnerSet \
   "$out/swift-runner-pod.yaml" "$out/ubuntu-runner-pod.yaml" "$out/browser-runner-pod.yaml" \
   "$out/swift-listener-pod.yaml" "$out/ubuntu-listener-pod.yaml" "$out/browser-listener-pod.yaml"
 
+step kustomize
+# The server's manifests with their generated ConfigMap, as the tenant applies them.
+kustomize build manifests/tenants/build-farm/server > "$out/build-farm-server.yaml"
+kubeconform -strict -summary "$out/build-farm-server.yaml"
+
 step jsonnet
-for f in build-farm/*.libsonnet; do
+for f in manifests/tenants/build-farm/server/config/*.libsonnet manifests/tenants/build-farm/server/config/*.jsonnet; do
   jsonnet "$f" > /dev/null
   echo "$f evaluates"
 done

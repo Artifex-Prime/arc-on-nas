@@ -21,12 +21,24 @@ All notable changes to this repository. The format follows
   `api-forward.yml` forwards the API server's port 6443, and nothing else, to another Docker
   network. The smoke test checks all of it.
 - The build farm's cache: a hostPath PersistentVolume `build-farm-cache`, reserved for the claim
-  `cache` in `build-farm`, and Buildbarn's storage settings for it (`build-farm/cache.libsonnet`):
+  `cache` in `build-farm`, and Buildbarn's storage settings for it
+  (`manifests/tenants/build-farm/server/config/cache.libsonnet`):
   fixed-size files of 131.2 GiB in all, below the volume's 150 GiB, with Buildbarn's recommended
   block counts for eviction. README "Tenant namespaces" has the host's part (a filesystem with a
   quota, the bind mount in `docker-compose.override.yml`). `scripts/lint.sh` evaluates the
   settings and `scripts/check-consistency.sh` checks they fit the volume; the smoke test checks
   the claim binds and another namespace's claim does not.
+- The build farm's server, Buildbarn, for the tenant `build-farm` to apply
+  (`manifests/tenants/build-farm/server/`, README "Tenant namespaces"): the storage pod on the
+  claim `cache`, the scheduler, and the frontend that clients use, at the versions bb-deployments
+  pins (bb-storage `20261102T091443Z-ca3d8b4`, bb-scheduler `20261102T094740Z-c9ba98c`), sized to
+  448Mi of requests and 1.75 GiB of limits, as uid 65532 and Pod Security `restricted`. The
+  configuration is jsonnet, generated into a ConfigMap; the cache settings moved next to it, from
+  `build-farm/`. README has the upgrade and rollback procedure. `scripts/lint.sh` renders it with
+  kustomize (added to `mise.toml`) and checks it with kubeconform, and
+  `scripts/check-consistency.sh` checks the storage pod's claim, mount, directories and user
+  against the cache settings. The smoke test applies it as a tenant, writes and reads a blob and an
+  action result through the frontend, and reads them again after a restart of the storage pod.
 - A disk bound for each tenant namespace: `requests.ephemeral-storage` and
   `limits.ephemeral-storage` in its ResourceQuota (`zuul-trial` 4Gi, `build-farm` 8Gi), and an
   ephemeral-storage default (512Mi, 64Mi requested) and maximum per container in its LimitRange,
