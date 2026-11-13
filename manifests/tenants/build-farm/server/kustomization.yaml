@@ -8,15 +8,6 @@
 # The configuration is generated into one ConfigMap, whose name carries a hash of its contents:
 # a changed file makes a new ConfigMap, and every pod that mounts it is replaced.
 #
-# No container names an ephemeral-storage request or limit. A node without the kubelet's local
-# storage isolation (README, "Tenant namespaces", "Disk") reports no ephemeral storage, and the
-# scheduler then places no pod that asks for any: the owner's host is such a node until
-# kristofk/AIDepartment#1384 turns isolation on. Nothing here writes to its own layer, and the
-# logs are small; once isolation works, put the requests and limits back (64Mi requested, 256Mi
-# limited for each server, 16Mi for the init container). The namespace's LimitRange (../quota.yaml)
-# gives every container that names none an ephemeral-storage default, so on such a node these pods
-# schedule only where that LimitRange is not applied yet, as on the owner's host now.
-#
 # The versions. Buildbarn has no releases; bb-deployments pins a tested set, and this follows it
 # (at its commit 7cd419f, 2026-11-06). bb-storage serves both the storage pod and the frontend.
 apiVersion: kustomize.config.k8s.io/v1beta1
