@@ -46,10 +46,9 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: {drop: [ALL]}
           # Measured idle at about 30 MiB. Its queue grows with the actions waiting in it.
-          # See kustomization.yaml for why no ephemeral-storage.
           resources:
-            requests: {cpu: 50m, memory: 64Mi}
-            limits: {cpu: "1", memory: 256Mi}
+            requests: {cpu: 50m, memory: 64Mi, ephemeral-storage: 64Mi}
+            limits: {cpu: "1", memory: 256Mi, ephemeral-storage: 256Mi}
           volumeMounts:
             - {name: config, mountPath: /config, readOnly: true}
       volumes:
