@@ -21,9 +21,11 @@ spec:
     limits.ephemeral-storage: 8Gi
     pods: "30"
     services: "10"
-    # A NodePort answers on every address of the node, outside the namespace's NetworkPolicies;
-    # there is no load balancer.
-    services.nodeports: "0"
+    # One NodePort: the frontend's for the forwarder (server/frontend.yaml, frontend-external). A
+    # NodePort answers on every address of the node and leads to its pods as their own address
+    # does, so their NetworkPolicies decide who gets through (networkpolicy.yaml). There is no
+    # load balancer.
+    services.nodeports: "1"
     services.loadbalancers: "0"
     configmaps: "50"
     # Every object is a row in k3s's datastore, which the runners need too: a bound on each kind.

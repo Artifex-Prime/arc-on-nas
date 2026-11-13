@@ -13,8 +13,12 @@ name: CI
 #        eviction for passing one, tenant-cert.sh's refusals and a
 #        certificate it signs used by kubectl with the kubeconfig it writes through
 #        api-forward.yml, the tenant NetworkPolicies against each target, with controls, and the
-#        build farm's server: applied by the tenant, a cache write and read through its frontend,
-#        and a restart of its storage pod that keeps them.
+#        build farm's server: applied by the tenant with a key pair from scripts/farm-tls.sh, a
+#        cache write and read through its frontend over TLS (no plain text, no client's action
+#        result), a restart of its storage pod that keeps them, and its network: the frontend
+#        reached from a runner pod and through farm-forward.yml, refused to the other tenant,
+#        another namespace, the host and another address on the stack network, at the NodePort
+#        and at the forwarder's addresses, and a renewed certificate served without a restart.
 #
 # What a hosted runner cannot show (README, "Status"): a scale set registering with GitHub and
 # running a job (that needs a real credential and a repository to register with), the runner
@@ -638,31 +642,49 @@ jobs:
           set -euo pipefail
           k() { docker compose exec -T k3s kubectl "$@"; }
           u=opifex-magnus
+          tk() { k --as "$u" --as-group devinfra -n build-farm "$@"; }
           # The directory the cache volume names, owned by the storage pod's user. On a host it is a
           # filesystem of its own, bind-mounted into the node (README, "Tenant namespaces"); here
           # it is a directory in the node's container.
           docker compose exec -T k3s sh -c 'd=/var/lib/build-farm-cache/storage
             mkdir -p "$d" && chown 65532:65532 "$d" && chmod 700 "$d"'
+          # The farm's CA and the frontend's key pair, as the tenant makes them (README, "The build
+          # farm's network"). The CA stays in $RUNNER_TEMP for the next step's renewal.
+          scripts/farm-tls.sh ca "$RUNNER_TEMP/farm-ca"
+          scripts/farm-tls.sh server --ca-cert "$RUNNER_TEMP/farm-ca/ca.crt" --ca-key "$RUNNER_TEMP/farm-ca/ca.key" \
+            | tk apply -f -
+          # The CA for the clients in the cluster, which trust it and nothing else for the farm.
+          ca=$(cat "$RUNNER_TEMP/farm-ca/ca.crt")
+          for ns in build-farm arc-runners zuul-trial default; do
+            k -n "$ns" create configmap build-farm-ca --from-literal=ca.crt="$ca"
+          done
           # Applied by the tenant, as on a host.
           server=/opt/arc-on-nas/manifests/tenants/build-farm/server
-          k --as "$u" --as-group devinfra -n build-farm apply -k "$server"
+          tk apply -k "$server"
           k -n build-farm rollout status statefulset/storage --timeout=300s
           k -n build-farm rollout status deployment/scheduler --timeout=180s
           k -n build-farm rollout status deployment/frontend --timeout=180s
           k -n build-farm get pods -o wide
+          k -n build-farm get services
           # A client in build-farm, as the farm's clients in the cluster will be (restricted, uid 65532).
           jq -n --arg image "$GRPCURL_IMAGE" '
             {apiVersion: "v1", kind: "Pod", metadata: {name: "client"}, spec: {
               automountServiceAccountToken: false,
               securityContext: {runAsUser: 65532, runAsGroup: 65532, runAsNonRoot: true,
                 seccompProfile: {type: "RuntimeDefault"}},
+              volumes: [{name: "ca", configMap: {name: "build-farm-ca"}}],
               containers: [{name: "c", image: $image, command: ["sleep", "900"],
+                volumeMounts: [{name: "ca", mountPath: "/ca", readOnly: true}],
                 securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}}}]}}' \
-            | k --as "$u" --as-group devinfra -n build-farm apply -f -
+            | tk apply -f -
           k -n build-farm wait --for=condition=Ready pod/client --timeout=180s
-          # call <method> <request>: one gRPC call to the frontend's Service from the client, the
-          # method found by the server's reflection service; prints the response.
-          call() { k -n build-farm exec client -- grpcurl -plaintext -max-time 20 -d "$2" frontend:8980 "$1"; }
+          # call <method> <request>: one gRPC call to the frontend's Service from the client, over
+          # TLS with the farm's CA, the method found by the server's reflection service; prints
+          # the response. store: the same to the storage pod, which only the namespace reaches.
+          call() { k -n build-farm exec client -- grpcurl -cacert /ca/ca.crt -max-time 20 -d "$2" frontend:8980 "$1"; }
+          store() {
+            k -n build-farm exec client -- grpcurl -plaintext -max-time 20 -d "$2" storage-0.storage:8981 "$1"
+          }
           # retry <command...>: until it succeeds, for up to a minute. A new pod's address reaches
           # the network policies and a new Service's endpoints reach kube-proxy a little after
           # the pod is ready; until then a connection is refused.
@@ -671,11 +693,18 @@ jobs:
             "$@"
           }
           retry call grpc.health.v1.Health/Check '{}'
+          # No plain-text gRPC on the frontend.
+          if k -n build-farm exec client -- grpcurl -plaintext -max-time 10 frontend:8980 \
+               grpc.health.v1.Health/Check; then
+            echo "the frontend answered without TLS" >&2; exit 1
+          fi
+          echo "the frontend without TLS: refused"
           re=build.bazel.remote.execution.v2
           data="arc-on-nas smoke test $(date -u +%FT%TZ)"
           b64=$(printf %s "$data" | base64 -w0)
           digest=$(jq -nc --arg h "$(printf %s "$data" | sha256sum | cut -d' ' -f1)" --argjson s "${#data}" \
             '{hash: $h, size_bytes: $s}')
+          result="{\"action_digest\":$digest,\"action_result\":{\"exit_code\":42,\"stdout_raw\":\"$b64\"}}"
           # check <when>: the blob and the action result read back through the frontend. Each step
           # returns on failure itself: under retry, set -e does not apply inside it.
           check() {
@@ -689,8 +718,14 @@ jobs:
           }
           call "$re.ContentAddressableStorage/BatchUpdateBlobs" \
             "{\"requests\":[{\"digest\":$digest,\"data\":\"$b64\"}]}"
-          call "$re.ActionCache/UpdateActionResult" \
-            "{\"action_digest\":$digest,\"action_result\":{\"exit_code\":42,\"stdout_raw\":\"$b64\"}}"
+          # A client may not write an action result through the frontend; the workers write them to
+          # the storage pod, as this does.
+          if call "$re.ActionCache/UpdateActionResult" "$result" 2> "$RUNNER_TEMP/out.txt"; then
+            echo "the frontend took an action result from a client" >&2; exit 1
+          fi
+          grep -q PermissionDenied "$RUNNER_TEMP/out.txt" || { cat "$RUNNER_TEMP/out.txt" >&2; exit 1; }
+          echo "an action result through the frontend: $(tr '\n' ' ' < "$RUNNER_TEMP/out.txt")"
+          store "$re.ActionCache/UpdateActionResult" "$result"
           check written
           # The cache's files are on the volume, at their configured size, and sparse.
           docker compose exec -T k3s sh -c 'cd /var/lib/build-farm-cache/storage
@@ -704,6 +739,149 @@ jobs:
           retry check "after a restart"
           k -n build-farm logs storage-0
           k -n build-farm delete pod client --wait=false
+
+      - name: The build farm's network and TLS
+        run: |
+          set -euo pipefail
+          k() { docker compose exec -T k3s kubectl "$@"; }
+          u=opifex-magnus
+          # Who reaches the frontend (README, "The build farm's network"): a runner pod through the
+          # cluster's DNS, a container on another Docker network through the forwarder, and nothing
+          # else: not the other tenant, not another namespace, not the host, not another address on
+          # the stack network. Each client below trusts the farm's CA and checks the name.
+          docker network create farm-test
+          FARM_FORWARD_NETWORK=farm-test docker compose -f farm-forward.yml up -d --wait
+          # The CA alone, readable by the containers below.
+          install -d -m 755 "$RUNNER_TEMP/farm-ca-public"
+          install -m 644 "$RUNNER_TEMP/farm-ca/ca.crt" "$RUNNER_TEMP/farm-ca-public/ca.crt"
+          # client: a restricted pod with grpcurl and the CA, as the runners are (uid 1001).
+          client() {
+            jq -n --arg image "$GRPCURL_IMAGE" --argjson uid 1001 '
+              {apiVersion: "v1", kind: "Pod", metadata: {name: "farm-client"}, spec: {
+                automountServiceAccountToken: false,
+                securityContext: {runAsUser: $uid, runAsGroup: $uid, runAsNonRoot: true,
+                  seccompProfile: {type: "RuntimeDefault"}},
+                volumes: [{name: "ca", configMap: {name: "build-farm-ca"}}],
+                containers: [{name: "c", image: $image, command: ["sleep", "900"],
+                  resources: {requests: {cpu: "50m", memory: "32Mi"}, limits: {cpu: "200m", memory: "64Mi"}},
+                  volumeMounts: [{name: "ca", mountPath: "/ca", readOnly: true}],
+                  securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}}}]}}'
+          }
+          client | k -n arc-runners apply -f -
+          client | k -n default apply -f -
+          client | k --as "$u" --as-group devinfra -n zuul-trial apply -f -
+          for ns in arc-runners default zuul-trial; do
+            k -n "$ns" wait --for=condition=Ready pod/farm-client --timeout=180s
+          done
+          # health <namespace> <address>: the frontend's health over TLS from that namespace's pod.
+          health() {
+            k -n "$1" exec farm-client -- grpcurl -cacert /ca/ca.crt -max-time 10 "$2" grpc.health.v1.Health/Check 2>&1
+          }
+          # reaches <namespace> <address>: it answers SERVING (after a minute of retries at most:
+          # a new pod's address reaches the policies a little after it is ready).
+          reaches() {
+            local out
+            for _ in $(seq 1 20); do
+              out=$(health "$1" "$2") && grep -q SERVING <<< "$out" && { echo "$1 -> $2: SERVING"; return 0; }
+              sleep 3
+            done
+            echo "$1 -> $2: $out" >&2; return 1
+          }
+          # refused <namespace> <address>: no connection at all, so not even TLS starts.
+          refused() {
+            local out
+            if out=$(health "$1" "$2"); then echo "$1 -> $2 answered: $out" >&2; return 1; fi
+            grep -q 'Failed to dial target host' <<< "$out" || { echo "$1 -> $2: $out" >&2; return 1; }
+            echo "$1 -> $2: refused"
+          }
+          reaches arc-runners frontend.build-farm.svc:8980
+          reaches arc-runners frontend.build-farm.svc.cluster.local:8980
+          # The runners reach the frontend only, not the farm's other servers.
+          rc=0
+          k -n arc-runners exec farm-client -- grpcurl -plaintext -max-time 10 \
+            storage-0.storage.build-farm.svc:8981 grpc.health.v1.Health/Check || rc=$?
+          echo "arc-runners -> storage-0.storage.build-farm.svc:8981: exit $rc"; [ "$rc" != 0 ]
+          refused zuul-trial frontend.build-farm.svc:8980
+          refused default frontend.build-farm.svc:8980
+          # The NodePort, on the node's address, turns away every source but the forwarder's.
+          refused default 172.31.250.10:30980
+          refused zuul-trial 172.31.250.10:30980
+          c=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' -k "https://172.31.250.10:30980/" || true)
+          echo "the host -> 172.31.250.10:30980: $c (want 000)"; [ "$c" = 000 ]
+          # The control: the host reaches the node's address, so the 000 above is the policy.
+          c=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' -k "https://172.31.250.10:6443/version" || true)
+          echo "the host -> 172.31.250.10:6443: $c (want 401)"; [ "$c" = 401 ]
+          c=$(docker run --rm --network ci_runners "$GRPCURL_IMAGE" -insecure -max-time 10 172.31.250.10:30980 \
+                grpc.health.v1.Health/Check 2>&1 || true)
+          echo "another address on the stack network -> 172.31.250.10:30980: $c"
+          grep -q 'Failed to dial target host' <<< "$c"
+          # Through the forwarder, from another Docker network, as the boxes do: the health, and the
+          # blob the previous step wrote.
+          far() {
+            docker run --rm --network farm-test -v "$RUNNER_TEMP/farm-ca-public:/t:ro" "$GRPCURL_IMAGE" \
+              -cacert /t/ca.crt -max-time 10 "$@"
+          }
+          for _ in $(seq 1 20); do far build-farm:8980 grpc.health.v1.Health/Check && break; sleep 3; done
+          far build-farm:8980 grpc.health.v1.Health/Check | grep -q SERVING
+          echo "farm-test -> build-farm:8980: SERVING"
+          if far -plaintext build-farm:8980 grpc.health.v1.Health/Check 2> /dev/null; then
+            echo "the forwarder's port answered without TLS" >&2; exit 1
+          fi
+          echo "farm-test -> build-farm:8980 without TLS: refused"
+          # The forwarder carries nobody else as itself: it listens only on its farm-test address,
+          # and turns away that network's gateway, which is the host.
+          docker logs "$(docker ps -q --filter label=com.docker.compose.project=ci-farm)"
+          c=$(docker run --rm --network ci_runners "$GRPCURL_IMAGE" -insecure -max-time 10 172.31.250.12:8980 \
+                grpc.health.v1.Health/Check 2>&1 || true)
+          echo "another address on the stack network -> the forwarder's 172.31.250.12:8980: $c"
+          grep -q 'Failed to dial target host' <<< "$c"
+          fwd_ip=$(docker inspect --format '{{(index .NetworkSettings.Networks "farm-test").IPAddress}}' \
+            "$(docker ps -q --filter label=com.docker.compose.project=ci-farm)")
+          for a in 172.31.250.12 "$fwd_ip"; do
+            c=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' --cacert "$RUNNER_TEMP/farm-ca-public/ca.crt" \
+                  --connect-to "build-farm:8980:$a:8980" https://build-farm:8980/ 2>&1 || true)
+            echo "the host -> the forwarder's $a:8980: $c"; [ "${c: -3}" = 000 ]
+          done
+          # Nor from another of the host's addresses, outside the forwarder's subnet: here the stack
+          # network's gateway, which any process on the host may connect from.
+          c=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' --cacert "$RUNNER_TEMP/farm-ca-public/ca.crt" \
+                --interface "$GATEWAY" --connect-to "build-farm:8980:$fwd_ip:8980" \
+                https://build-farm:8980/ 2>&1 || true)
+          echo "the host from $GATEWAY -> the forwarder's $fwd_ip:8980: $c"; [ "${c: -3}" = 000 ]
+          docker logs "$(docker ps -q --filter label=com.docker.compose.project=ci-farm)" 2>&1 | tail -n 5
+
+          # Renewal: a new key pair in the Secret, served from then on without a restart. The
+          # kubelet updates the volume within about a minute or two, and bb-storage reads it again
+          # every minute.
+          # served: the serial of the certificate the forwarder's clients get, in lower case without
+          # leading zeros (curl's %{certs} lists the server's certificate first).
+          served() {
+            docker run --rm --network farm-test -v "$RUNNER_TEMP/farm-ca-public:/t:ro" "$CURL_IMAGE" \
+              -sS -o /dev/null -m 10 -w '%{certs}' --cacert /t/ca.crt https://build-farm:8980/ 2> /dev/null \
+              | sed -n 's/^Serial Number: *//p' | head -n 1 | tr -d ':' | tr 'A-F' 'a-f' | sed 's/^0*//'
+          }
+          before=$(served); echo "served before the renewal: $before"
+          restarts() {
+            k -n build-farm get pods -l app.kubernetes.io/name=frontend \
+              -o jsonpath='{.items[*].status.containerStatuses[0].restartCount}'
+          }
+          restarts=$(restarts)
+          scripts/farm-tls.sh server --ca-cert "$RUNNER_TEMP/farm-ca/ca.crt" --ca-key "$RUNNER_TEMP/farm-ca/ca.key" \
+            2> "$RUNNER_TEMP/renewed.txt" | k --as "$u" --as-group devinfra -n build-farm apply -f -
+          want=$(sed -n 's/^serial=//p' "$RUNNER_TEMP/renewed.txt" | tr 'A-F' 'a-f' | sed 's/^0*//')
+          echo "renewed: serial $want"
+          [ -n "$before" ] && [ "$before" != "$want" ]
+          now=""
+          for _ in $(seq 1 60); do now=$(served); [ "$now" = "$want" ] && break; sleep 5; done
+          echo "served after the renewal: $now"; [ "$now" = "$want" ]
+          after=$(restarts)
+          echo "frontend restarts: $restarts before, $after after"; [ "$restarts" = "$after" ]
+          far build-farm:8980 grpc.health.v1.Health/Check | grep -q SERVING
+
+          for ns in arc-runners default zuul-trial; do k -n "$ns" delete pod farm-client --wait=false; done
+          docker compose -p ci-farm down
+          docker network rm farm-test
+          server=/opt/arc-on-nas/manifests/tenants/build-farm/server
           k --as "$u" --as-group devinfra -n build-farm delete -k "$server" --wait=false
 
       - name: The proxy saw the pulls

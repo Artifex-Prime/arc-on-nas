@@ -1,6 +1,7 @@
-# The tenant namespace build-farm: remote build and test execution, and its cache (the volume and
-# its claim; the cache's sizes are in server/config/cache.libsonnet). The server itself, server/,
-# is the tenant's to apply, and is not listed here.
+# The tenant namespace build-farm: remote build and test execution, its cache (the volume and its
+# claim; the cache's sizes are in server/config/cache.libsonnet), and who may reach its frontend
+# (networkpolicy.yaml). The server itself, server/, is the tenant's to apply, and is not listed
+# here.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: build-farm
@@ -9,4 +10,5 @@ resources:
   - quota.yaml
   - cache-volume.yaml
   - cache-claim.yaml
+  - networkpolicy.yaml
   - ../base

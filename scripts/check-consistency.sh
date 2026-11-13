@@ -159,6 +159,35 @@ frontend_image=$(yq 'select(.kind == "Deployment") | .spec.template.spec.contain
 [ "$storage_image" = "$frontend_image" ] || problem "$farm_frontend: the frontend's image is not the storage pod's $storage_image"
 echo "build farm server: $storage_image, cache at $mount_path"
 
+# The build farm's network (README, "Tenant namespaces", "The build farm's network"): the
+# forwarder connects to the frontend's NodePort on the node, from a fixed address of its own that
+# the frontend's NetworkPolicy lets in; its alias is a name the frontend's certificate carries; and
+# the frontend reads its key pair where the Secret is mounted.
+farm_forward=farm-forward.yml
+farm_policy=manifests/tenants/build-farm/networkpolicy.yaml
+farm_config=manifests/tenants/build-farm/server/config/frontend.jsonnet
+node_ip=$(sed -n '/^  k3s:/,/^  [a-z]/{s/^ *ipv4_address: *\([0-9.]*\).*/\1/p}' docker-compose.yml)
+node_port=$(yq 'select(.metadata.name == "frontend-external") | .spec.ports[] | select(.name == "grpc") | .nodePort' "$farm_frontend")
+grep -q "^ *TARGET=TCP4:$node_ip:$node_port$" "$farm_forward" || problem "$farm_forward: the forwarder's target is not $node_ip:$node_port"
+[ "$(yq 'select(.metadata.name == "frontend-external") | .spec.externalTrafficPolicy' "$farm_frontend")" = Local ] \
+  || problem "$farm_frontend: frontend-external does not keep the source address (externalTrafficPolicy Local)"
+farm_fwd=$(yq '.services.forward.networks.runners.ipv4_address' "$farm_forward")
+grep -q "^ *runners=$farm_fwd$" "$farm_forward" || problem "$farm_forward: the address it does not listen on is not its own $farm_fwd"
+[ "${farm_fwd%.*}.0/24" = "$subnet" ] || problem "$farm_forward: the forwarder's address $farm_fwd is not in $subnet"
+case "$farm_fwd" in "$node_ip"|"$proxy"|"$forward"|"$gateway") problem "$farm_forward: $farm_fwd is taken" ;; esac
+[ "$(yq '.spec.ingress[].from[] | select(has("ipBlock")) | .ipBlock.cidr' "$farm_policy")" = "$farm_fwd/32" ] \
+  || problem "$farm_policy: the ipBlock is not the forwarder's $farm_fwd/32"
+alias=$(yq '.services.forward.networks.clients.aliases[0]' "$farm_forward")
+grep -q "^ *names=(.* ${alias}[ )]" scripts/farm-tls.sh || problem "scripts/farm-tls.sh: the certificate does not name the forwarder's alias $alias"
+tls_mount=$(yq 'select(.kind == "Deployment") | .spec.template.spec.containers[] | .volumeMounts[] | select(.name == "tls") | .mountPath' "$farm_frontend")
+tls_secret=$(yq 'select(.kind == "Deployment") | .spec.template.spec.volumes[] | select(.name == "tls") | .secret.secretName' "$farm_frontend")
+for f in certificatePath privateKeyPath; do
+  path=$(jsonnet "$farm_config" | yq -p json ".grpcServers[0].tls.serverKeyPair.files.$f")
+  [ "${path%/*}" = "$tls_mount" ] || problem "$farm_config: $f $path is not in the key pair's mount $tls_mount"
+done
+grep -q "^secret=$tls_secret$" scripts/farm-tls.sh || problem "scripts/farm-tls.sh: the default Secret is not $tls_secret"
+echo "build farm network: $farm_fwd -> $node_ip:$node_port, alias $alias, key pair $tls_secret at $tls_mount"
+
 # Helper images used by more than one script.
 alpine_pre=$(sed -n 's/^test_image=//p' scripts/preflight.sh)
 alpine_trial=$(sed -n 's/^pod_image=//p' scripts/trial.sh)

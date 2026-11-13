@@ -21,8 +21,9 @@
     },
   },
 
-  // Who may connect. Everyone that reaches the port: the namespace's NetworkPolicy lets in only
-  // the namespace's own pods (../../../base/networkpolicy.yaml). Per-client credentials come with
-  // the clients outside the cluster.
+  // Who may connect. Everyone that reaches the port: the namespace's NetworkPolicies let in only
+  // the namespace's own pods (../../../base/networkpolicy.yaml), and to the frontend also the
+  // runners and the forwarder (../../networkpolicy.yaml). Per-client credentials come later.
   allowAll: { allow: {} },
+  denyAll: { deny: {} },
 }

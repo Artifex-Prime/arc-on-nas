@@ -8,6 +8,14 @@ All notable changes to this repository. The format follows
 
 ### Added
 
+- The build farm's network and TLS (README "The build farm's network"): the frontend speaks TLS
+  only, with a key pair from a CA of the farm's own that it reads again every minute, so a renewal
+  needs no restart (`scripts/farm-tls.sh` makes the CA and signs the key pair into the Secret
+  `frontend-tls`); the runner pods reach its port through the cluster's DNS (`allow-build-farm`),
+  and `farm-forward.yml` forwards it to another Docker network through the NodePort
+  `frontend-external`, which `build-farm`'s quota now allows; the frontend's NetworkPolicy admits
+  those two and nothing else. The frontend takes no action result or file system access profile
+  from a client. The smoke test checks each route, each refusal and a renewal.
 - Tenant namespaces (`manifests/tenants/`, README "Tenant namespaces"): `zuul-trial` and
   `build-farm`, for users other than the cluster admin, each with Pod Security `baseline` enforced
   and `restricted` warned and audited, a ResourceQuota (CPU, memory, storage and a count of every
